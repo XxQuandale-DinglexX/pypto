@@ -253,12 +253,7 @@ std::string FormatShape(const std::vector<ExprPtr>& shape) {
     if (i > 0) {
       oss << ", ";
     }
-    auto const_dim = GetConstantDimension(shape[i]);
-    if (const_dim) {
-      oss << *const_dim;
-    } else {
-      oss << "?";
-    }
+    oss << shape[i];
   }
   oss << "]";
   return oss.str();
