@@ -209,6 +209,76 @@ class TestTupleTypeResolver:
             resolver.resolve_type(node)
 
 
+class TestPlTupleSubscriptTypeResolver:
+    """Tests for pl.Tuple[T1, T2, ...] subscript type resolution."""
+
+    def test_resolve_pl_tuple_two_tensors(self):
+        """Test resolving pl.Tuple[pl.Tensor[...], pl.Tensor[...]]."""
+        resolver = _make_resolver()
+
+        code = "pl.Tuple[pl.Tensor[[64], pl.FP32], pl.Tensor[[128], pl.FP16]]"
+        node = ast.parse(code, mode="eval").body
+
+        result = resolver.resolve_type(node)
+        assert isinstance(result, ir.TupleType)
+        assert len(result.types) == 2
+        assert isinstance(result.types[0], ir.TensorType)
+        assert result.types[0].dtype == DataType.FP32
+        assert isinstance(result.types[1], ir.TensorType)
+        assert result.types[1].dtype == DataType.FP16
+
+    def test_resolve_pl_tuple_single_element(self):
+        """Test resolving pl.Tuple[pl.Scalar[pl.INT32]] with single element."""
+        resolver = _make_resolver()
+
+        code = "pl.Tuple[pl.Scalar[pl.INT32]]"
+        node = ast.parse(code, mode="eval").body
+
+        result = resolver.resolve_type(node)
+        assert isinstance(result, ir.TupleType)
+        assert len(result.types) == 1
+        assert isinstance(result.types[0], ir.ScalarType)
+        assert result.types[0].dtype == DataType.INT32
+
+    def test_resolve_pl_tuple_empty(self):
+        """Test resolving pl.Tuple[()] empty tuple."""
+        resolver = _make_resolver()
+
+        code = "pl.Tuple[()]"
+        node = ast.parse(code, mode="eval").body
+
+        result = resolver.resolve_type(node)
+        assert isinstance(result, ir.TupleType)
+        assert len(result.types) == 0
+
+    def test_resolve_pl_tuple_nested_error(self):
+        """Test that pl.Tuple[pl.Tuple[...], ...] raises error."""
+        resolver = _make_resolver()
+
+        code = "pl.Tuple[pl.Tuple[pl.Scalar[pl.INT32]], pl.Scalar[pl.FP32]]"
+        node = ast.parse(code, mode="eval").body
+
+        with pytest.raises(ParserTypeError, match="Nested tuple types"):
+            resolver.resolve_type(node)
+
+    def test_resolve_pl_tuple_roundtrip(self):
+        """Test print → parse round-trip with pl.Tuple[...] syntax."""
+        func = pl.parse("""
+@pl.function
+def func(
+    x: pl.Tensor[[64], pl.FP32],
+    y: pl.Tensor[[64], pl.FP32],
+) -> pl.Tuple[pl.Tensor[[64], pl.FP32], pl.Tensor[[64], pl.FP32]]:
+    a: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+    b: pl.Tensor[[64], pl.FP32] = pl.mul(y, 2.0)
+    return a, b
+""")
+        printed = func.as_python()
+        assert "pl.Tuple[" in printed
+        reparsed = pl.parse(printed)
+        ir.assert_structural_equal(func, reparsed)
+
+
 class TestDynamicShapeResolution:
     """Tests for dynamic shape dimension resolution."""
 
