@@ -196,9 +196,15 @@ class PTOCodegen : public CodegenBase {
    * input and output would otherwise share the same buffer).
    *
    * @param tile_buf_type_string The tile_buf type string for the alloc_tile instruction
+   * @param name_hint Preferred SSA name seed
+   * @param addr_ssa Optional SSA value for the alloc_tile addr operand
+   * @param valid_row_ssa Optional SSA value for the alloc_tile valid_row operand
+   * @param valid_col_ssa Optional SSA value for the alloc_tile valid_col operand
    * @return New SSA variable name for the allocated buffer
    */
-  std::string AllocNewTileBuf(const std::string& tile_buf_type_string, const std::string& name_hint = "");
+  std::string AllocNewTileBuf(const std::string& tile_buf_type_string, const std::string& name_hint = "",
+                              const std::string& addr_ssa = "", const std::string& valid_row_ssa = "",
+                              const std::string& valid_col_ssa = "");
 
   /**
    * @brief Override the current result buffer name
@@ -233,11 +239,14 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] std::string GetImportBufferSSA() const;
 
   /**
-   * @brief Get the split value for a tile var produced by a tpop operation
+   * @brief Get the split value for a tile var produced by a matching tpop operation
    * @param var Raw pointer to the tile variable
-   * @return Split value from the originating tpop (0 if not found)
+   * @param expected_tpop_op_name Expected originating tpop op name
+   * @param tfree_op_name Name of the consuming tfree op for diagnostics
+   * @return Split value from the originating tpop
    */
-  [[nodiscard]] int GetTpopSplit(const ir::Var* var) const;
+  [[nodiscard]] int GetValidatedTpopSplit(const ir::Var* var, const std::string& expected_tpop_op_name,
+                                          const std::string& tfree_op_name) const;
 
   /**
    * @brief Check if the current function is an AIC (Cube) function
@@ -378,8 +387,16 @@ class PTOCodegen : public CodegenBase {
   std::set<double> emitted_float_constants_;
   std::map<double, std::string> float_const_names_;
 
-  /// Dynamically allocated tile buffers (SSA name, type string) emitted at function scope
-  std::vector<std::pair<std::string, std::string>> extra_alloc_tiles_;
+  struct ExtraAllocTile {
+    std::string name;
+    std::string type_string;
+    std::string addr_ssa;
+    std::string valid_row_ssa;
+    std::string valid_col_ssa;
+  };
+
+  /// Dynamically allocated tile buffers emitted at function scope
+  std::vector<ExtraAllocTile> extra_alloc_tiles_;
   /// Unified SSA → tile_buf type mapping.  Every typed tile SSA value
   /// (root alloc, reshape result, fillpad result, etc.) has an entry here.
   /// GetExprTypeAnnotation uses this as the primary lookup.
@@ -395,7 +412,12 @@ class PTOCodegen : public CodegenBase {
   /// This is the single source of truth for per-variable alloc_tile emission.
   std::vector<std::pair<ir::VarPtr, std::shared_ptr<const ir::TileType>>> tile_var_allocs_;
   std::set<const ir::Var*> emitted_tile_alloc_vars_;
-  std::map<const ir::Var*, int> tpop_result_vars_;  ///< Tile vars from tpop: var -> split value
+  struct TpopResultInfo {
+    int split = 0;
+    std::string op_name;
+  };
+  std::map<const ir::Var*, TpopResultInfo>
+      tpop_result_vars_;  ///< Tile vars from tpop: var -> split + op name
 
   // Current function context
   ir::FunctionPtr current_function_;

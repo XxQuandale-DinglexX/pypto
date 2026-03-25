@@ -11,16 +11,20 @@
 
 #include "pypto/codegen/pto/pto_codegen.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <ios>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -35,8 +39,10 @@
 #include "pypto/ir/memref.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/scope_outline_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -84,6 +90,53 @@ static std::string DataTypeToMLIRImpl(::pypto::DataType dtype) {
   } else {
     throw pypto::ValueError("Invalid DataType value");
   }
+}
+
+static std::vector<const ir::Var*> GetSortedVarRefs(const std::unordered_set<const ir::Var*>& refs) {
+  std::vector<const ir::Var*> sorted_refs(refs.begin(), refs.end());
+  std::sort(sorted_refs.begin(), sorted_refs.end(), [](const ir::Var* lhs, const ir::Var* rhs) {
+    if (lhs == rhs) return false;
+    if (lhs->name_hint_ != rhs->name_hint_) return lhs->name_hint_ < rhs->name_hint_;
+    return lhs->UniqueId() < rhs->UniqueId();
+  });
+  return sorted_refs;
+}
+
+static std::unordered_set<const ir::Var*> CollectStmtDefinedVars(const ir::StmtPtr& stmt) {
+  std::unordered_set<const ir::Var*> defs;
+  if (auto assign = As<ir::AssignStmt>(stmt)) {
+    defs.insert(assign->var_.get());
+  } else if (auto for_stmt = As<ir::ForStmt>(stmt)) {
+    for (const auto& ret : for_stmt->return_vars_) {
+      defs.insert(ret.get());
+    }
+  } else if (auto if_stmt = As<ir::IfStmt>(stmt)) {
+    for (const auto& ret : if_stmt->return_vars_) {
+      defs.insert(ret.get());
+    }
+  } else if (auto while_stmt = As<ir::WhileStmt>(stmt)) {
+    for (const auto& ret : while_stmt->return_vars_) {
+      defs.insert(ret.get());
+    }
+  }
+  return defs;
+}
+
+static std::pair<VarPtr, VarPtr> GetTileValidShapeVars(const std::shared_ptr<const ir::TileType>& tile_type) {
+  VarPtr valid_row_var;
+  VarPtr valid_col_var;
+  if (!tile_type || !tile_type->tile_view_.has_value()) {
+    return {valid_row_var, valid_col_var};
+  }
+
+  const auto& tile_view = tile_type->tile_view_.value();
+  if (tile_view.valid_shape.size() >= 1) {
+    valid_row_var = As<ir::Var>(tile_view.valid_shape[0]);
+  }
+  if (tile_view.valid_shape.size() >= 2) {
+    valid_col_var = As<ir::Var>(tile_view.valid_shape[1]);
+  }
+  return {valid_row_var, valid_col_var};
 }
 
 // Helper function to convert MemorySpace to PTO address space string
@@ -450,64 +503,129 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
 std::vector<ir::StmtPtr> PTOCodegen::ReorderTpopChains(const std::vector<ir::StmtPtr>& stmts) const {
   if (tpop_result_vars_.empty()) return stmts;
 
+  auto make_body = [](const std::vector<ir::StmtPtr>& body_stmts, const ir::Span& span) -> ir::StmtPtr {
+    return std::make_shared<ir::SeqStmts>(body_stmts, span);
+  };
+  auto flatten_body = [](const ir::StmtPtr& body) -> std::vector<ir::StmtPtr> {
+    if (auto seq = As<ir::SeqStmts>(body)) {
+      return seq->stmts_;
+    }
+    return {body};
+  };
+
+  std::function<ir::StmtPtr(const ir::StmtPtr&)> reorder_nested =
+      [&](const ir::StmtPtr& stmt) -> ir::StmtPtr {
+    if (auto for_stmt = As<ir::ForStmt>(stmt)) {
+      auto new_body = ReorderTpopChains(flatten_body(for_stmt->body_));
+      return std::make_shared<ir::ForStmt>(
+          for_stmt->loop_var_, for_stmt->start_, for_stmt->stop_, for_stmt->step_, for_stmt->iter_args_,
+          make_body(new_body, for_stmt->span_), for_stmt->return_vars_, for_stmt->span_, for_stmt->kind_,
+          for_stmt->chunk_size_, for_stmt->chunk_policy_, for_stmt->loop_origin_);
+    }
+    if (auto if_stmt = As<ir::IfStmt>(stmt)) {
+      auto new_then = ReorderTpopChains(flatten_body(if_stmt->then_body_));
+      std::optional<ir::StmtPtr> new_else;
+      if (if_stmt->else_body_.has_value()) {
+        auto else_stmts = ReorderTpopChains(flatten_body(if_stmt->else_body_.value()));
+        new_else = make_body(else_stmts, if_stmt->span_);
+      }
+      return std::make_shared<ir::IfStmt>(if_stmt->condition_, make_body(new_then, if_stmt->span_), new_else,
+                                          if_stmt->return_vars_, if_stmt->span_);
+    }
+    if (auto while_stmt = As<ir::WhileStmt>(stmt)) {
+      auto new_body = ReorderTpopChains(flatten_body(while_stmt->body_));
+      return std::make_shared<ir::WhileStmt>(while_stmt->condition_, while_stmt->iter_args_,
+                                             make_body(new_body, while_stmt->span_), while_stmt->return_vars_,
+                                             while_stmt->span_);
+    }
+    return stmt;
+  };
+
+  std::vector<ir::StmtPtr> normalized_inputs;
+  normalized_inputs.reserve(stmts.size());
+  for (const auto& stmt : stmts) {
+    normalized_inputs.push_back(reorder_nested(stmt));
+  }
+
   // Phase 1: classify statements into tpop chains
   struct TpopChain {
     size_t tpop_idx;
     std::vector<size_t> user_idxs;
     size_t tfree_idx = SIZE_MAX;
+    size_t last_use_idx = 0;
   };
   std::map<const ir::Var*, TpopChain> chains;
   std::vector<const ir::Var*> tpop_order;
-  std::vector<bool> in_chain(stmts.size(), false);
+  std::vector<bool> in_chain(normalized_inputs.size(), false);
 
-  // Build a set of vars defined within the tpop region (after first tpop)
-  // to detect dependency hazards when reordering.
-  std::set<const ir::Var*> region_defined_vars;
+  // Track vars defined since the first tpop while scanning forward. This lets
+  // us reject only statements that depend on definitions that appear before
+  // the current use, instead of every variable defined anywhere later.
+  std::set<const ir::Var*> defined_since_first_tpop;
   bool seen_first_tpop = false;
-  for (const auto& stmt : stmts) {
-    if (auto assign = As<ir::AssignStmt>(stmt)) {
-      if (!seen_first_tpop && tpop_result_vars_.count(assign->var_.get()) > 0) {
-        seen_first_tpop = true;
-      }
-      if (seen_first_tpop) {
-        region_defined_vars.insert(assign->var_.get());
-      }
-    }
-  }
-
-  for (size_t i = 0; i < stmts.size(); ++i) {
-    if (auto assign = As<ir::AssignStmt>(stmts[i])) {
+  for (size_t i = 0; i < normalized_inputs.size(); ++i) {
+    const auto stmt_defined_vars = CollectStmtDefinedVars(normalized_inputs[i]);
+    if (auto assign = As<ir::AssignStmt>(normalized_inputs[i])) {
       // Tpop assignment itself
       if (tpop_result_vars_.count(assign->var_.get()) > 0) {
-        chains[assign->var_.get()] = {i, {}, SIZE_MAX};
+        seen_first_tpop = true;
+        chains[assign->var_.get()] = {i, {}, SIZE_MAX, i};
         tpop_order.push_back(assign->var_.get());
         in_chain[i] = true;
+        defined_since_first_tpop.insert(stmt_defined_vars.begin(), stmt_defined_vars.end());
         continue;
       }
-      // Check if this is a direct user of exactly one tpop var
+      if (!seen_first_tpop) {
+        continue;
+      }
+      std::unordered_set<const ir::Var*> refs;
       if (auto call = As<ir::Call>(assign->value_)) {
-        const ir::Var* ref = nullptr;
-        bool multi = false;
-        bool has_unsafe_dep = false;
-        for (const auto& arg : call->args_) {
-          if (auto v = ir::AsVarLike(arg); v && tpop_result_vars_.count(v.get()) > 0) {
-            if (ref && ref != v.get()) {
-              multi = true;
-              break;
-            }
-            ref = v.get();
-          } else if (auto v = ir::AsVarLike(arg); v && region_defined_vars.count(v.get()) > 0) {
-            // This arg references a non-tpop var defined in the region —
-            // moving this stmt could create use-before-def.
-            has_unsafe_dep = true;
+        auto collect_expr_refs = [&](const ir::ExprPtr& expr) {
+          if (auto v = ir::AsVarLike(expr)) {
+            refs.insert(v.get());
+            return;
           }
+          ir::outline_utils::VarRefCollector collector;
+          collector.VisitExpr(expr);
+          refs.insert(collector.var_refs.begin(), collector.var_refs.end());
+        };
+        for (const auto& arg : call->args_) {
+          collect_expr_refs(arg);
         }
-        if (ref && !multi && !has_unsafe_dep && chains.count(ref) > 0) {
-          chains[ref].user_idxs.push_back(i);
-          in_chain[i] = true;
+      } else {
+        ir::outline_utils::VarRefCollector collector;
+        collector.VisitStmt(assign);
+        refs.insert(collector.var_refs.begin(), collector.var_refs.end());
+      }
+      const auto sorted_refs = GetSortedVarRefs(refs);
+      const ir::Var* ref = nullptr;
+      bool multi = false;
+      bool has_unsafe_dep = false;
+      for (const auto* var_ref : sorted_refs) {
+        if (tpop_result_vars_.count(var_ref) > 0) {
+          if (chains.count(var_ref) > 0) {
+            chains[var_ref].last_use_idx = std::max(chains[var_ref].last_use_idx, i);
+          }
+          if (ref && ref != var_ref) {
+            multi = true;
+            break;
+          }
+          ref = var_ref;
+        } else if (defined_since_first_tpop.count(var_ref) > 0) {
+          // This stmt references a non-tpop var defined in the region —
+          // moving it could create use-before-def.
+          has_unsafe_dep = true;
         }
       }
-    } else if (auto eval = As<ir::EvalStmt>(stmts[i])) {
+      if (ref && !multi && !has_unsafe_dep && chains.count(ref) > 0) {
+        chains[ref].user_idxs.push_back(i);
+        in_chain[i] = true;
+      }
+      defined_since_first_tpop.insert(stmt_defined_vars.begin(), stmt_defined_vars.end());
+    } else if (auto eval = As<ir::EvalStmt>(normalized_inputs[i])) {
+      if (!seen_first_tpop) {
+        continue;
+      }
       // tfree statement
       if (auto call = As<ir::Call>(eval->expr_)) {
         if (call->op_ &&
@@ -516,42 +634,102 @@ std::vector<ir::StmtPtr> PTOCodegen::ReorderTpopChains(const std::vector<ir::Stm
           if (auto v = ir::AsVarLike(call->args_[0]); v && tpop_result_vars_.count(v.get()) > 0) {
             if (chains.count(v.get()) > 0) {
               chains[v.get()].tfree_idx = i;
-              in_chain[i] = true;
             }
+            continue;
           }
         }
       }
+      std::unordered_set<const ir::Var*> refs;
+      ir::outline_utils::VarRefCollector collector;
+      collector.VisitStmt(eval);
+      refs.insert(collector.var_refs.begin(), collector.var_refs.end());
+      const auto sorted_refs = GetSortedVarRefs(refs);
+      const ir::Var* ref = nullptr;
+      bool multi = false;
+      bool has_unsafe_dep = false;
+      for (const auto* var_ref : sorted_refs) {
+        if (tpop_result_vars_.count(var_ref) > 0) {
+          if (chains.count(var_ref) > 0) {
+            chains[var_ref].last_use_idx = std::max(chains[var_ref].last_use_idx, i);
+          }
+          if (ref && ref != var_ref) {
+            multi = true;
+            break;
+          }
+          ref = var_ref;
+        } else if (defined_since_first_tpop.count(var_ref) > 0) {
+          has_unsafe_dep = true;
+        }
+      }
+      if (ref && !multi && !has_unsafe_dep && chains.count(ref) > 0) {
+        chains[ref].user_idxs.push_back(i);
+        in_chain[i] = true;
+      }
+      defined_since_first_tpop.insert(stmt_defined_vars.begin(), stmt_defined_vars.end());
+    } else {
+      if (!seen_first_tpop) {
+        continue;
+      }
+      std::unordered_set<const ir::Var*> refs;
+      ir::outline_utils::VarRefCollector collector;
+      collector.VisitStmt(normalized_inputs[i]);
+      refs.insert(collector.var_refs.begin(), collector.var_refs.end());
+      const auto sorted_refs = GetSortedVarRefs(refs);
+      const ir::Var* ref = nullptr;
+      bool multi = false;
+      bool has_unsafe_dep = false;
+      for (const auto* var_ref : sorted_refs) {
+        if (tpop_result_vars_.count(var_ref) > 0) {
+          if (chains.count(var_ref) > 0) {
+            chains[var_ref].last_use_idx = std::max(chains[var_ref].last_use_idx, i);
+          }
+          if (ref && ref != var_ref) {
+            multi = true;
+            break;
+          }
+          ref = var_ref;
+        } else if (defined_since_first_tpop.count(var_ref) > 0) {
+          has_unsafe_dep = true;
+        }
+      }
+      if (ref && !multi && !has_unsafe_dep && chains.count(ref) > 0) {
+        chains[ref].user_idxs.push_back(i);
+        in_chain[i] = true;
+      }
+      defined_since_first_tpop.insert(stmt_defined_vars.begin(), stmt_defined_vars.end());
     }
   }
 
-  if (tpop_order.empty()) return stmts;
+  if (tpop_order.empty()) return normalized_inputs;
 
   // Phase 2: build reordered list
   size_t first_tpop = chains[tpop_order[0]].tpop_idx;
   std::vector<ir::StmtPtr> result;
-  result.reserve(stmts.size());
+  result.reserve(normalized_inputs.size());
 
   // Prefix: stmts before first tpop
   for (size_t i = 0; i < first_tpop; ++i) {
-    result.push_back(stmts[i]);
+    result.push_back(normalized_inputs[i]);
   }
 
   // Chains in order: tpop → users → tfree
   for (const auto* var : tpop_order) {
     auto& ch = chains[var];
-    result.push_back(stmts[ch.tpop_idx]);
+    result.push_back(normalized_inputs[ch.tpop_idx]);
     for (size_t ui : ch.user_idxs) {
-      result.push_back(stmts[ui]);
+      result.push_back(normalized_inputs[ui]);
     }
-    if (ch.tfree_idx != SIZE_MAX) {
-      result.push_back(stmts[ch.tfree_idx]);
+    size_t last_grouped_idx = ch.user_idxs.empty() ? ch.tpop_idx : ch.user_idxs.back();
+    if (ch.tfree_idx != SIZE_MAX && ch.last_use_idx <= last_grouped_idx) {
+      result.push_back(normalized_inputs[ch.tfree_idx]);
+      in_chain[ch.tfree_idx] = true;
     }
   }
 
   // Remaining independent stmts (after first tpop, not in any chain)
-  for (size_t i = first_tpop; i < stmts.size(); ++i) {
+  for (size_t i = first_tpop; i < normalized_inputs.size(); ++i) {
     if (!in_chain[i]) {
-      result.push_back(stmts[i]);
+      result.push_back(normalized_inputs[i]);
     }
   }
 
@@ -564,12 +742,12 @@ void PTOCodegen::BuildVarToMemRefMapping(const FunctionPtr& func) {
     std::map<const ir::Var*, const ir::MemRef*>& var_to_memref;
     std::map<const ir::MemRef*, std::string>& memref_to_var_name;
     std::vector<std::pair<VarPtr, std::shared_ptr<const TileType>>>& tile_var_allocs;
-    std::map<const ir::Var*, int>& tpop_result_vars;
+    std::map<const ir::Var*, TpopResultInfo>& tpop_result_vars;
 
     VarMemRefMapper(std::map<const ir::Var*, const ir::MemRef*>& mapping,
                     std::map<const ir::MemRef*, std::string>& reverse_mapping,
                     std::vector<std::pair<VarPtr, std::shared_ptr<const TileType>>>& allocs,
-                    std::map<const ir::Var*, int>& tpop_vars)
+                    std::map<const ir::Var*, TpopResultInfo>& tpop_vars)
         : var_to_memref(mapping),
           memref_to_var_name(reverse_mapping),
           tile_var_allocs(allocs),
@@ -591,7 +769,7 @@ void PTOCodegen::BuildVarToMemRefMapping(const FunctionPtr& func) {
         if (auto call = As<ir::Call>(op->value_)) {
           if (call->op_->name_ == "tile.tpop_from_aiv" || call->op_->name_ == "tile.tpop_from_aic") {
             int split = call->GetKwarg<int>("split", 0);
-            tpop_result_vars[op->var_.get()] = split;
+            tpop_result_vars[op->var_.get()] = TpopResultInfo{split, call->op_->name_};
           }
         }
       }
@@ -703,19 +881,9 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
 
   std::string valid_row_mlir;
   std::string valid_col_mlir;
-  if (tile_type->tile_view_.has_value()) {
-    const auto& tv = tile_type->tile_view_.value();
-    if (tv.valid_shape.size() >= 1) {
-      if (auto var = As<ir::Var>(tv.valid_shape[0])) {
-        valid_row_mlir = GetVarName(var);
-      }
-    }
-    if (tv.valid_shape.size() >= 2) {
-      if (auto var = As<ir::Var>(tv.valid_shape[1])) {
-        valid_col_mlir = GetVarName(var);
-      }
-    }
-  }
+  auto [valid_row_var, valid_col_var] = GetTileValidShapeVars(tile_type);
+  if (valid_row_var) valid_row_mlir = GetVarName(valid_row_var);
+  if (valid_col_var) valid_col_mlir = GetVarName(valid_col_var);
 
   std::string type_str = GetTileBufTypeStringFromTileType(tile_type);
   auto memref = ir::GetDefinedMemRef(tile_type);
@@ -819,10 +987,12 @@ std::string PTOCodegen::GetTileBufForMemRef(const MemRefPtr& memref) {
   return it->second;
 }
 
-std::string PTOCodegen::AllocNewTileBuf(const std::string& tile_buf_type_string,
-                                        const std::string& name_hint) {
+std::string PTOCodegen::AllocNewTileBuf(const std::string& tile_buf_type_string, const std::string& name_hint,
+                                        const std::string& addr_ssa, const std::string& valid_row_ssa,
+                                        const std::string& valid_col_ssa) {
   std::string name = NewNamedTemp(name_hint);
-  extra_alloc_tiles_.emplace_back(name, tile_buf_type_string);
+  extra_alloc_tiles_.push_back(
+      ExtraAllocTile{name, tile_buf_type_string, addr_ssa, valid_row_ssa, valid_col_ssa});
   ssa_to_tile_buf_type_[name] = tile_buf_type_string;
   return name;
 }
@@ -856,11 +1026,15 @@ void PTOCodegen::RecordImportBufferSSA(const std::string& ssa) {
 
 std::string PTOCodegen::GetImportBufferSSA() const { return import_buf_ssa_; }
 
-int PTOCodegen::GetTpopSplit(const ir::Var* var) const {
+int PTOCodegen::GetValidatedTpopSplit(const ir::Var* var, const std::string& expected_tpop_op_name,
+                                      const std::string& tfree_op_name) const {
   auto it = tpop_result_vars_.find(var);
   INTERNAL_CHECK(it != tpop_result_vars_.end())
-      << "Internal error: GetTpopSplit called for var not in tpop_result_vars_";
-  return it->second;
+      << "Internal error: GetValidatedTpopSplit called for var not in tpop_result_vars_";
+  CHECK(it->second.op_name == expected_tpop_op_name)
+      << tfree_op_name << " requires its tile argument to come from " << expected_tpop_op_name << ", got "
+      << it->second.op_name;
+  return it->second.split;
 }
 
 bool PTOCodegen::IsAICFunction() const {
@@ -872,8 +1046,18 @@ bool PTOCodegen::IsAIVFunction() const {
 }
 
 void PTOCodegen::EmitExtraAllocTiles() {
-  for (const auto& [name, type_str] : extra_alloc_tiles_) {
-    stream_ << GetIndent() << name << " = pto.alloc_tile : " << type_str << "\n";
+  for (const auto& alloc : extra_alloc_tiles_) {
+    stream_ << GetIndent() << alloc.name << " = pto.alloc_tile";
+    if (!alloc.addr_ssa.empty()) {
+      stream_ << " addr = " << alloc.addr_ssa;
+    }
+    if (!alloc.valid_row_ssa.empty()) {
+      stream_ << " valid_row = " << alloc.valid_row_ssa;
+    }
+    if (!alloc.valid_col_ssa.empty()) {
+      stream_ << " valid_col = " << alloc.valid_col_ssa;
+    }
+    stream_ << " : " << alloc.type_string << "\n";
   }
 }
 
@@ -1030,6 +1214,11 @@ std::string PTOCodegen::GetVarName(const VarPtr& var) {
   }
   if (auto tile_type = ir::GetTileTypeWithMemRef(var->GetType())) {
     return GetTileBufForMemRef(ir::GetDefinedMemRef(tile_type));
+  }
+  for (const auto& [mapped_var, mlir_name] : var_to_mlir_) {
+    if (mapped_var && mapped_var->name_hint_ == var->name_hint_) {
+      return mlir_name;
+    }
   }
   LOG_ERROR << "Variable " << var->name_hint_ << " not found in MLIR mapping";
   return "";
@@ -1644,13 +1833,8 @@ void PTOCodegen::VisitStmt_(const YieldStmtPtr& op) {
 
 std::string PTOCodegen::GetScalarIterArgTypeString(
     const std::shared_ptr<const ScalarType>& scalar_type) const {
-  if (scalar_type && scalar_type->dtype_ == DataType::BOOL) {
-    return "i1";
-  }
-  if (scalar_type && scalar_type->dtype_.IsFloat()) {
-    return GetTypeString(scalar_type->dtype_);
-  }
-  return "index";
+  CHECK(scalar_type) << "PTOCodegen requires a valid ScalarType for iter_arg/result emission";
+  return GetTypeString(scalar_type->dtype_);
 }
 
 void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
@@ -1678,58 +1862,105 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
     }
     Emit("}");
   } else {
-    // scf.if with return values
-    std::vector<std::string> return_var_names;
-    std::vector<std::string> return_var_types;
-    for (const auto& return_var : op->return_vars_) {
-      std::string ret_name = NewNamedTemp(return_var->name_hint_);
-      BindVarToMlir(return_var, ret_name);
-      return_var_names.push_back(ret_name);
-      if (auto tensor_type = As<TensorType>(return_var->GetType())) {
+    // Like loops, keep tile return values out of scf.if results. Materialize
+    // them into pre-declared tile buffers inside each branch, and only use
+    // scf.if results for scalar-like SSA values.
+    std::vector<bool> returns_via_scf(op->return_vars_.size(), false);
+    std::vector<std::string> scf_return_names;
+    std::vector<std::string> scf_return_types;
+    std::vector<std::string> tile_return_targets(op->return_vars_.size());
+    std::vector<std::string> tile_return_types(op->return_vars_.size());
+
+    for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+      const auto& return_var = op->return_vars_[i];
+      if (auto scalar_type = As<ScalarType>(return_var->GetType())) {
+        std::string ret_name = NewNamedTemp(return_var->name_hint_);
+        BindVarToMlir(return_var, ret_name);
+        scf_return_names.push_back(ret_name);
+        scf_return_types.push_back(GetScalarIterArgTypeString(scalar_type));
+        returns_via_scf[i] = true;
+      } else if (auto tensor_type = As<TensorType>(return_var->GetType())) {
+        std::string ret_name = NewNamedTemp(return_var->name_hint_);
+        BindVarToMlir(return_var, ret_name);
         BindTensorView(return_var, ret_name);
-        return_var_types.push_back(GetTensorViewTypeString(tensor_type.get()));
+        scf_return_names.push_back(ret_name);
+        scf_return_types.push_back(GetTensorViewTypeString(tensor_type.get()));
+        returns_via_scf[i] = true;
       } else if (auto tile_type = As<TileType>(return_var->GetType())) {
         INTERNAL_CHECK(tile_type->memref_.has_value())
             << "TileType return_var must have a MemRef at codegen stage for var: " << return_var->name_hint_;
-        return_var_types.push_back(GetTileBufTypeString(tile_type->memref_.value().get()));
+        std::string tile_type_string = GetTileBufTypeStringFromTileType(tile_type);
+        std::string addr_ssa;
+        std::string valid_row_ssa;
+        std::string valid_col_ssa;
+        if (auto const_addr = As<ir::ConstInt>(tile_type->memref_.value()->addr_)) {
+          addr_ssa = GetOrEmitI64Constant(const_addr->value_);
+        }
+        auto [valid_row_var, valid_col_var] = GetTileValidShapeVars(tile_type);
+        if (valid_row_var) valid_row_ssa = GetVarName(valid_row_var);
+        if (valid_col_var) valid_col_ssa = GetVarName(valid_col_var);
+        std::string ret_name =
+            AllocNewTileBuf(tile_type_string, return_var->name_hint_, addr_ssa, valid_row_ssa, valid_col_ssa);
+        BindVarToMlir(return_var, ret_name);
+        tile_return_targets[i] = ret_name;
+        tile_return_types[i] = tile_type_string;
       } else {
-        return_var_types.push_back(GetScalarIterArgTypeString(As<ScalarType>(return_var->GetType())));
+        INTERNAL_CHECK(false) << "Internal error: unsupported IfStmt return_var type for "
+                              << return_var->name_hint_;
       }
     }
 
     CHECK(op->else_body_.has_value()) << "IfStmt with return_vars requires else_body";
 
-    // Emit: %ret0, %ret1 = scf.if %cond -> (type0, type1) {
-    Emit(JoinCommaSep(return_var_names) + " = scf.if " + condition + " -> (" +
-         JoinCommaSep(return_var_types) + ") {");
+    if (!scf_return_names.empty()) {
+      Emit(JoinCommaSep(scf_return_names) + " = scf.if " + condition + " -> (" +
+           JoinCommaSep(scf_return_types) + ") {");
+    } else {
+      Emit("scf.if " + condition + " {");
+    }
     indent_level_++;
 
-    // Then branch
-    yield_buffer_.clear();
-    VisitStmt(op->then_body_);
-    if (!yield_buffer_.empty()) {
-      Emit("scf.yield " + JoinCommaSep(yield_buffer_) + " : " + JoinCommaSep(return_var_types));
-    }
-    CHECK(yield_buffer_.size() == return_var_types.size())
-        << "IfStmt then-branch yield count (" << yield_buffer_.size() << ") must match return_vars ("
-        << return_var_types.size() << ")";
-    yield_buffer_.clear();
+    auto emit_branch = [&](const StmtPtr& body, const char* branch_name) {
+      yield_buffer_.clear();
+      VisitStmt(body);
+      auto branch_yields = yield_buffer_;
+      CHECK(branch_yields.size() == op->return_vars_.size())
+          << "IfStmt " << branch_name << "-branch yield count (" << branch_yields.size()
+          << ") must match return_vars (" << op->return_vars_.size() << ")";
+
+      std::vector<std::string> scalar_yields;
+      scalar_yields.reserve(scf_return_types.size());
+      for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+        if (returns_via_scf[i]) {
+          scalar_yields.push_back(branch_yields[i]);
+          continue;
+        }
+        if (tile_return_targets[i].empty() || branch_yields[i].empty()) continue;
+        if (branch_yields[i] == tile_return_targets[i]) continue;
+
+        std::string src_type = GetSSATileBufType(branch_yields[i]);
+        INTERNAL_CHECK(!src_type.empty())
+            << "Internal error: missing tile type for IfStmt branch yield " << branch_yields[i];
+        Emit("pto.tmov ins(" + branch_yields[i] + " : " + src_type + ") outs(" + tile_return_targets[i] +
+             " : " + tile_return_types[i] + ")");
+      }
+
+      if (!scf_return_types.empty()) {
+        Emit("scf.yield " + JoinCommaSep(scalar_yields) + " : " + JoinCommaSep(scf_return_types));
+      }
+      CHECK(scalar_yields.size() == scf_return_types.size())
+          << "IfStmt " << branch_name << "-branch scalar yield count (" << scalar_yields.size()
+          << ") must match scalar return_vars (" << scf_return_types.size() << ")";
+      yield_buffer_.clear();
+    };
+
+    emit_branch(op->then_body_, "then");
     indent_level_--;
 
-    // Else branch
-    if (op->else_body_.has_value()) {
-      Emit("} else {");
-      indent_level_++;
-      VisitStmt(*op->else_body_);
-      if (!yield_buffer_.empty()) {
-        Emit("scf.yield " + JoinCommaSep(yield_buffer_) + " : " + JoinCommaSep(return_var_types));
-      }
-      CHECK(yield_buffer_.size() == return_var_types.size())
-          << "IfStmt else-branch yield count (" << yield_buffer_.size() << ") must match return_vars ("
-          << return_var_types.size() << ")";
-      yield_buffer_.clear();
-      indent_level_--;
-    }
+    Emit("} else {");
+    indent_level_++;
+    emit_branch(*op->else_body_, "else");
+    indent_level_--;
     Emit("}");
   }
 }
