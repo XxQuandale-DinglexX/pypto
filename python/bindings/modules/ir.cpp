@@ -110,6 +110,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
       kwargs.emplace_back(key, nb::cast<MemorySpace>(item.second));
     } else if (nb::isinstance<TensorLayout>(item.second)) {
       kwargs.emplace_back(key, nb::cast<TensorLayout>(item.second));
+    } else if (nb::isinstance<TileLayout>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<TileLayout>(item.second));
     } else if (nb::isinstance<PipeType>(item.second)) {
       // Cast enum to int for storage
       kwargs.emplace_back(key, static_cast<int>(nb::cast<PipeType>(item.second)));
@@ -540,6 +542,8 @@ void BindIR(nb::module_& m) {
             result[key.c_str()] = AnyCast<MemorySpace>(value, "converting to Python: " + key);
           } else if (value.type() == typeid(TensorLayout)) {
             result[key.c_str()] = AnyCast<TensorLayout>(value, "converting to Python: " + key);
+          } else if (value.type() == typeid(TileLayout)) {
+            result[key.c_str()] = AnyCast<TileLayout>(value, "converting to Python: " + key);
           } else if (value.type() == typeid(PadValue)) {
             result[key.c_str()] = AnyCast<PadValue>(value, "converting to Python: " + key);
           }
