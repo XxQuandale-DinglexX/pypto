@@ -662,11 +662,12 @@ class TestGenerateArgUnpacking:
     def test_mixed_tensor_scalar(self):
         func = _make_func("test_fn", [("input", "tensor"), ("scale", "scalar"), ("output", "tensor")])
         code, names = _generate_arg_unpacking(func)
+        # Tensors-first: input=args[0], output=args[1], scale=args[2]
         assert "reinterpret_cast<__gm__ TensorData*>(args[0])" in code
-        assert "scale_conv.u64 = args[1];" in code
+        assert "reinterpret_cast<__gm__ TensorData*>(args[1])" in code
+        assert "scale_conv.u64 = args[2];" in code
         assert "float scale = scale_conv.val;" in code
-        assert "reinterpret_cast<__gm__ TensorData*>(args[2])" in code
-        assert names == ["input", "scale", "output"]
+        assert names == ["input", "output", "scale"]
 
     def test_scalar_only(self):
         func = _make_func("test_fn", [("x", "scalar"), ("y", "scalar")])
@@ -713,7 +714,8 @@ class TestGenerateKernelWrapper:
     def test_contains_forward_call(self):
         func = _make_func("my_kernel", [("a", "tensor"), ("s", "scalar"), ("out", "tensor")])
         wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
-        assert "my_kernel(a, s, out);" in wrapper
+        # Tensors-first: a=arg0, out=arg1, s=arg2
+        assert "my_kernel(a, out, s);" in wrapper
 
     def test_ptoas_code_made_static(self):
         func = _make_func("my_kernel", [("a", "tensor"), ("s", "scalar"), ("out", "tensor")])
@@ -1262,6 +1264,46 @@ def test_pto_codegen_mixed_scalar_and_tile_iter_args():
     yield_line = _single_line(lines, "scf.yield")
     assert "tile_buf" not in yield_line, f"tile_buf should not appear in scf.yield: {yield_line}"
     assert "index" in yield_line, f"Expected index type in scf.yield: {yield_line}"
+
+
+def test_pto_codegen_slice_fillpad_partial_dynamic_valid_shape():
+    """Slice with partially dynamic valid_shape followed by fillpad must not create spurious slice_buf."""
+
+    @pl.program
+    class SliceFillpadProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            scores_in: pl.Tensor[[16, 64], pl.FP32],
+            valid_len: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            scores: pl.Tile[[16, 64], pl.FP32] = pl.load(scores_in, [0, 0], [16, 64])
+            sliced: pl.Tile[[16, 64], pl.FP32] = pl.tile.slice(
+                scores, [16, 64], [0, 0], valid_shape=[16, valid_len]
+            )
+            padded: pl.Tile[[16, 64], pl.FP32] = pl.fillpad(sliced, pad_value=pl.PadValue.min)
+            return pl.store(padded, [0, 0], out)
+
+    mlir_code = _generate_default_mlir(SliceFillpadProgram)
+
+    # No spurious slice_buf should be allocated — slice reuses its pre-allocated buffer
+    assert "slice_buf" not in mlir_code, (
+        f"Unexpected slice_buf allocation — tile.slice should reuse the pre-allocated buffer.\n{mlir_code}"
+    )
+
+    # The textract should reference the sliced tile's SSA (not a separate slice_buf)
+    textract_lines = [line.strip() for line in mlir_code.splitlines() if "pto.textract" in line]
+    assert len(textract_lines) == 1, f"Expected one textract, got: {textract_lines}"
+    assert "slice_buf" not in textract_lines[0], (
+        f"textract should not reference slice_buf: {textract_lines[0]}"
+    )
+
+    # The tfillpad input type should have v_row=? and v_col=? (force_all_dynamic)
+    fillpad_lines = [line.strip() for line in mlir_code.splitlines() if "pto.tfillpad" in line]
+    assert len(fillpad_lines) == 1, f"Expected one tfillpad, got: {fillpad_lines}"
+    assert "v_row=?" in fillpad_lines[0], f"fillpad input should have v_row=?: {fillpad_lines[0]}"
+    assert "v_col=?" in fillpad_lines[0], f"fillpad input should have v_col=?: {fillpad_lines[0]}"
 
 
 if __name__ == "__main__":

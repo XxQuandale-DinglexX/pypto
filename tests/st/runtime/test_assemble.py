@@ -54,9 +54,9 @@ class TileAssembleAccMatTestCase(PTOTestCase):
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
-            TensorSpec("a", [32, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
-            TensorSpec("b", [16, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=torch.rand),
+            TensorSpec("a", [32, 16], DataType.FP32, init_value=torch.rand),
+            TensorSpec("b", [16, 16], DataType.FP32, init_value=torch.rand),
             TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
         ]
 
@@ -89,8 +89,8 @@ class TileAssembleVecTestCase(PTOTestCase):
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
-            TensorSpec("src", [32, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=torch.rand),
+            TensorSpec("src", [32, 16], DataType.FP32, init_value=torch.rand),
             TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
         ]
 
@@ -125,8 +125,8 @@ class TileAssembleRowByRowTestCase(PTOTestCase):
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
-            TensorSpec("src", [32, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=torch.rand),
+            TensorSpec("src", [32, 16], DataType.FP32, init_value=torch.rand),
             TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
         ]
 
@@ -161,8 +161,8 @@ class TileAssembleDoubleLoopTestCase(PTOTestCase):
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
-            TensorSpec("src", [32, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=torch.rand),
+            TensorSpec("src", [32, 16], DataType.FP32, init_value=torch.rand),
             TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
         ]
 
@@ -197,8 +197,8 @@ class TileAssembleLoopColBroadcastTestCase(PTOTestCase):
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
-            TensorSpec("src", [32, 8], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=torch.rand),
+            TensorSpec("src", [32, 8], DataType.FP32, init_value=torch.rand),
             TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
         ]
 
@@ -233,8 +233,8 @@ class TileAssembleDoubleLoopBroadcastTestCase(PTOTestCase):
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
-            TensorSpec("x", [32, 32], DataType.FP32, init_value=lambda s: torch.rand(s)),
-            TensorSpec("src", [16, 16], DataType.FP32, init_value=lambda s: torch.rand(s)),
+            TensorSpec("x", [32, 32], DataType.FP32, init_value=torch.rand),
+            TensorSpec("src", [16, 16], DataType.FP32, init_value=torch.rand),
             TensorSpec("y", [32, 32], DataType.FP32, is_output=True),
         ]
 

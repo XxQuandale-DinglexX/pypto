@@ -479,30 +479,6 @@ std::string GenerateIncludes() {
   return oss.str();
 }
 
-std::string GenerateArgDefines(const FunctionPtr& func, const std::vector<std::string>& return_var_names) {
-  std::ostringstream oss;
-  int idx = 0;
-
-  // Pointer defines for input tensor params
-  for (const auto& var : func->params_) {
-    if (As<TensorType>(var->GetType())) {
-      std::string name = GetSSABaseName(var->name_hint_);
-      std::string upper_name = name;
-      for (auto& ch : upper_name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-      oss << "#define ARG_PTR_" << upper_name << " " << idx++ << "\n";
-    }
-  }
-  // Pointer defines for return tensors
-  for (const auto& name : return_var_names) {
-    std::string upper_name = name;
-    for (auto& ch : upper_name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-    oss << "#define ARG_PTR_" << upper_name << " " << idx++ << "\n";
-  }
-
-  oss << "\n";
-  return oss.str();
-}
-
 std::string GenerateHelperFunctions() {
   std::ostringstream oss;
   oss << "// Helper to encode float as uint64_t for scalar params\n";
@@ -518,46 +494,56 @@ std::string GenerateHelperFunctions() {
   return oss.str();
 }
 
+// Generate scalar variable declaration from OrchArg scalar slot.
+// Uses value_as<T>() for type-safe reinterpretation (memcpy-based type punning).
+std::string GenerateScalarUnpack(const std::string& var_name, int orch_index,
+                                 const ScalarTypePtr& scalar_type) {
+  std::ostringstream oss;
+  std::string cpp_type = scalar_type->dtype_.ToCTypeString();
+  oss << "    " << cpp_type << " " << var_name << " = orch[" << orch_index << "].value_as<" << cpp_type
+      << ">();\n";
+  return oss.str();
+}
+
 const char TENSOR_HELPER_FUNCTION[] = R"(
 static inline Tensor make_tensor_external_2d_dn(void* addr,
-    const uint64_t shapes[],
-    uint64_t ndims,
+    const uint32_t shapes[],
+    uint32_t ndims,
     DataType dtype = DataType::FLOAT32,
     int32_t version = 0) {
     debug_assert(ndims == 2);
-    static uint64_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
     uint64_t total = 1;
-    for (uint64_t i = 0; i < ndims; i++) {
+    for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    uint64_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS] = {shapes[1], shapes[0]};
+    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS] = {shapes[1], shapes[0]};
     return Tensor(addr, total * get_element_size(dtype),
-        raw_shapes, shapes, zero_offsets, ndims, dtype, version);
+        raw_shapes, shapes, zero_offsets, ndims, dtype, version, true, false);
 }
 
 static inline Tensor make_tensor_2d_dn(
-    const uint64_t shapes[],
-    uint64_t ndims,
+    const uint32_t shapes[],
+    uint32_t ndims,
     DataType dtype = DataType::FLOAT32,
     int32_t version = 0) {
     debug_assert(ndims == 2);
-    static uint64_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
     uint64_t total = 1;
-    for (uint64_t i = 0; i < ndims; i++) {
+    for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    uint64_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS] = {shapes[1], shapes[0]};
+    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS] = {shapes[1], shapes[0]};
     return Tensor(0, total * get_element_size(dtype),
-        raw_shapes, shapes, zero_offsets, ndims, dtype, version);
+        raw_shapes, shapes, zero_offsets, ndims, dtype, version, true, false);
 }
 )";
 
 std::string GenerateConfigFunction(int expected_arg_count) {
   std::ostringstream oss;
   oss << "__attribute__((visibility(\"default\")))\n";
-  oss << "PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {\n";
-  oss << "    (void)args;\n";
-  oss << "    (void)arg_count;\n";
+  oss << "PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {\n";
+  oss << "    (void)orch_args;\n";
   oss << "    return PTO2OrchestrationConfig{\n";
   oss << "        .expected_arg_count = " << expected_arg_count << ",\n";
   oss << "    };\n";
@@ -568,53 +554,46 @@ std::string GenerateConfigFunction(int expected_arg_count) {
   return oss.str();
 }
 
-// Returns the submit-task call prefix for the given core type and backend.
-// A2/A3: pto2_rt_submit_aiv_task(rt, id, params, n)
-//         pto2_rt_submit_aic_task(rt, id, params, n)
-// A5:    pto2_rt_submit_task(rt, id, PTO2_WORKER_VECTOR, params, n)
-//         pto2_rt_submit_task(rt, id, PTO2_WORKER_CUBE,   params, n)
-// Returns {func_call_with_rt_and_id_prefix, extra_worker_arg_or_empty}.
-// Caller emits: prefix << func_id << extra << ", " << task_var << ", " << n << ");\n"
-std::pair<std::string, std::string> CoreTypeToSubmitParts(CoreType core_type) {
-  bool is_a5 = pypto::backend::GetBackendType() == pypto::backend::BackendType::Ascend950;
-  if (is_a5) {
-    std::string worker = core_type == CoreType::CUBE ? "PTO2_WORKER_CUBE" : "PTO2_WORKER_VECTOR";
-    return {"pto2_rt_submit_task(rt, ", ", " + worker};
-  }
+// Returns true when targeting an A5 (Ascend950) backend.
+bool IsA5Backend() { return pypto::backend::GetBackendType() == pypto::backend::BackendType::Ascend950; }
+
+// Returns "rt, " for A5 backends (explicit PTO2Runtime* argument), "" otherwise (TLS-based).
+std::string RtArg() { return IsA5Backend() ? "rt, " : ""; }
+
+// Returns "rt" for A5 backends (PTO2_SCOPE(rt)), "" for A2/A3 (PTO2_SCOPE()).
+std::string ScopeArg() { return IsA5Backend() ? "rt" : ""; }
+
+// Returns the opening of a pto2_rt_submit_{aic,aiv}_task call up to (and including) any rt arg.
+// A2/A3: "pto2_rt_submit_aic_task("    caller appends: func_id << ", " << params << ");"
+// A5:    "pto2_rt_submit_aic_task(rt, " caller appends: func_id << ", " << params << ");"
+std::string CoreTypeToSubmitPrefix(CoreType core_type) {
   std::string func = core_type == CoreType::CUBE ? "pto2_rt_submit_aic_task" : "pto2_rt_submit_aiv_task";
-  return {func + "(rt, ", ""};
+  return func + "(" + RtArg();
 }
 
 // Removed DataTypeToPTO2Enum — now uses DataTypeToString from dtype.h
 
-// Generate make_tensor_external with shape array, ndim, and dtype
-std::string GenerateMakeTensorExternal(const std::string& var_name, const std::string& ptr_name,
+// Generate external tensor declaration from OrchArg
+std::string GenerateMakeTensorExternal(const std::string& var_name, int orch_index,
                                        const TensorTypePtr& tensor_type, const CodegenBase& codegen) {
   std::ostringstream oss;
-  size_t ndim = tensor_type->shape_.size();
-  size_t shape_arr_len = (ndim == 0) ? 1 : ndim;
 
-  // Declare shape array (minimum size 1 for valid C++)
-  oss << "    uint64_t " << var_name << "_shapes[" << shape_arr_len << "] = {";
-  if (ndim == 0) {
-    oss << "1";
-  } else {
-    for (size_t i = 0; i < ndim; ++i) {
-      if (i > 0) oss << ", ";
-      oss << codegen.GenerateExprString(tensor_type->shape_[i]);
-    }
-  }
-  oss << "};\n";
+  bool is_dn = tensor_type->tensor_view_.has_value() && tensor_type->tensor_view_->layout == TensorLayout::DN;
 
-  // check layout DN
-  std::string runtime_func = "make_tensor_external";
-  if (tensor_type->tensor_view_.has_value() && tensor_type->tensor_view_->layout == TensorLayout::DN) {
+  if (is_dn) {
+    // DN layout: swap shapes and use make_tensor_external_2d_dn
+    size_t ndim = tensor_type->shape_.size();
     CHECK(ndim == 2) << "only support 2D tensor for DN layout now";
-    runtime_func = "make_tensor_external_2d_dn";
+    oss << "    uint32_t " << var_name << "_shapes[2] = {"
+        << "orch[" << orch_index << "].tensor.shapes[1], "
+        << "orch[" << orch_index << "].tensor.shapes[0]};\n";
+    oss << "    Tensor ext_" << var_name << " = make_tensor_external_2d_dn("
+        << "orch[" << orch_index << "].data<void>(), " << var_name << "_shapes, " << ndim << ", "
+        << codegen.GetRuntimeDataTypeString(tensor_type->dtype_) << ");\n";
+  } else {
+    // ND layout: use OrchArg::to_tensor() directly
+    oss << "    Tensor ext_" << var_name << " = orch[" << orch_index << "].to_tensor();\n";
   }
-  // Generate make_tensor_external call
-  oss << "    Tensor ext_" << var_name << " = " << runtime_func << "(" << ptr_name << ", " << var_name
-      << "_shapes, " << ndim << ", " << codegen.GetRuntimeDataTypeString(tensor_type->dtype_) << ");\n";
 
   return oss.str();
 }
@@ -628,15 +607,20 @@ class OrchestrationStmtCodegen : public CodegenBase {
  public:
   explicit OrchestrationStmtCodegen(const ProgramPtr& prog, std::map<std::string, int>* func_ids,
                                     std::map<std::string, CoreType>* core_types, int* next_id,
-                                    std::unordered_map<const Var*, std::string> emit_name_map,
-                                    std::set<std::string> param_name_set)
+                                    std::unordered_map<const Var*, std::string> param_to_emit_name,
+                                    std::unordered_map<const Var*, const Var*> var_to_param,
+                                    std::set<std::string> param_name_set,
+                                    std::map<std::string, int> param_name_to_orch_index)
       : program_(prog),
         func_name_to_id_(func_ids),
         func_name_to_core_type_(core_types),
         next_func_id_(next_id),
-        emit_name_map_(std::move(emit_name_map)),
+        emit_name_map_(std::move(param_to_emit_name)),
+        var_to_param_(std::move(var_to_param)),
         param_name_set_(std::move(param_name_set)),
-        declared_var_names_(param_name_set_) {}
+        param_name_to_orch_index_(std::move(param_name_to_orch_index)) {
+    declared_var_names_ = param_name_set_;
+  }
 
   // Set per-call tuple elements using unique keys (avoids cross-call collision)
   void SetCallTupleElements(const std::map<std::string, std::vector<TupleElement>>& elements) {
@@ -661,6 +645,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
   void SetNonOptimizableAssembleRoots(const std::unordered_set<const Var*>& roots) {
     non_optimizable_assemble_roots_ = roots;
   }
+
+  void SetInitialIndent(int indent) { indent_ = indent; }
 
   std::string GetGeneratedCode() const { return code_.str(); }
 
@@ -690,10 +676,21 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return CodegenBase::TryGetVarName(expr);
   }
   [[nodiscard]] std::string GetTensorDataPtr(const std::string& name) const override {
-    if (param_name_set_.count(name)) {
-      return "arg_" + name + "_ptr";
+    auto it = param_name_to_orch_index_.find(name);
+    if (it != param_name_to_orch_index_.end()) {
+      return "orch[" + std::to_string(it->second) + "].data<void>()";
     }
     return name + ".data";
+  }
+
+  [[nodiscard]] std::string GetTensorShapeDim(const std::string& name, int64_t axis) const override {
+    auto it = param_name_to_orch_index_.find(name);
+    if (it != param_name_to_orch_index_.end()) {
+      return "(int64_t)orch[" + std::to_string(it->second) + "].tensor.shapes[" + std::to_string(axis) + "]";
+    }
+    // Fallback for non-parameter tensors (views, aliases, internal tensors):
+    // read the shape from the runtime Tensor object directly.
+    return "(int64_t)" + name + ".shapes[" + std::to_string(axis) + "]";
   }
 
   void VisitStmt_(const ForStmtPtr& for_stmt) override {
@@ -723,7 +720,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     code_ << Indent() << "for (int64_t " << loop_var << " = " << start_expr << "; " << loop_var << " < "
           << stop_expr << "; " << loop_var << " += " << step_expr << ") {\n";
     indent_ += 4;
-    code_ << Indent() << "PTO2_SCOPE(rt) {\n";
+    code_ << Indent() << "PTO2_SCOPE(" << ScopeArg() << ") {\n";
     indent_ += 4;
 
     auto saved = current_return_vars_;
@@ -849,7 +846,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   struct ParamEntry {
-    std::string kind;  // "make_input_param", "make_output_param", "make_inout_param", "make_scalar_param"
+    std::string kind;  // "add_input", "add_output", "add_inout", "add_scalar"
     std::string value;
   };
 
@@ -861,13 +858,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
       const auto& arg = call->args_[arg_idx];
       std::string var_name = TryGetVarName(arg);
       if (!var_name.empty()) {
-        // Check if this is a scalar variable (not a tensor) -> make_scalar_param
+        // Check if this is a scalar variable (not a tensor) -> add_scalar
         if (auto scalar_type = As<ScalarType>(arg->GetType())) {
           std::string cpp_type = scalar_type->dtype_.ToCTypeString();
           if (cpp_type == "float") {
-            params.push_back({"make_scalar_param", "float_to_u64(" + var_name + ")"});
+            params.push_back({"add_scalar", "float_to_u64(" + var_name + ")"});
           } else {
-            params.push_back({"make_scalar_param", var_name});
+            params.push_back({"add_scalar", var_name});
           }
           continue;
         }
@@ -880,28 +877,32 @@ class OrchestrationStmtCodegen : public CodegenBase {
             << callee_func->param_directions_.size() << ") for callee '" << callee_name << "'";
         ParamDirection dir = callee_func->param_directions_[arg_idx];
         if (dir == ParamDirection::Out) {
-          params.push_back({"make_output_param", ext_name});
+          params.push_back({"add_output", ext_name});
         } else if (dir == ParamDirection::InOut) {
-          params.push_back({"make_inout_param", ext_name});
+          params.push_back({"add_inout", ext_name});
         } else {
-          params.push_back({"make_input_param", ext_name});
+          params.push_back({"add_input", ext_name});
         }
       } else if (auto const_int = As<ConstInt>(arg)) {
         std::string cpp_type = const_int->dtype().ToCTypeString();
         std::string value = FormatConstIntValue(const_int, cpp_type);
-        params.push_back({"make_scalar_param", "(uint64_t)" + value});
+        params.push_back({"add_scalar", "(uint64_t)" + value});
       } else if (auto const_float = As<ConstFloat>(arg)) {
         std::string cpp_type = const_float->dtype().ToCTypeString();
         std::string value = FormatConstFloatValue(const_float, cpp_type);
         if (cpp_type == "float") {
-          params.push_back({"make_scalar_param", "float_to_u64(" + value + "f)"});
+          params.push_back({"add_scalar", "float_to_u64(" + value + "f)"});
         } else {
-          params.push_back({"make_scalar_param", "(uint64_t)" + value});
+          params.push_back({"add_scalar", "(uint64_t)" + value});
         }
       } else if (auto const_bool = As<ConstBool>(arg)) {
-        params.push_back({"make_scalar_param", const_bool->value_ ? "(uint64_t)1" : "(uint64_t)0"});
+        params.push_back({"add_scalar", const_bool->value_ ? "(uint64_t)1" : "(uint64_t)0"});
       }
     }
+
+    // New PTOParam API: tensors must precede scalars (see check_add_tensor_valid() in pto_types.h)
+    std::stable_partition(params.begin(), params.end(),
+                          [](const ParamEntry& p) { return p.kind != "add_scalar"; });
 
     return params;
   }
@@ -1007,18 +1008,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string ind = Indent();
 
-    // Generate PTOParam array and submit_task
+    // Generate PTOParam object and submit_task
     std::string task_var = "params_t" + std::to_string(task_counter_);
     code_ << "\n";
     code_ << ind << "// Task " << task_counter_ << ": " << callee_name << "\n";
-    code_ << ind << "PTOParam " << task_var << "[] = {\n";
+    code_ << ind << "PTOParam " << task_var << ";\n";
     for (const auto& p : params) {
-      code_ << ind << "    " << p.kind << "(" << p.value << "),\n";
+      code_ << ind << task_var << "." << p.kind << "(" << p.value << ");\n";
     }
-    code_ << ind << "};\n";
-    auto [submit_prefix, worker_arg] = CoreTypeToSubmitParts(core_type);
-    code_ << ind << submit_prefix << func_id << worker_arg << ", " << task_var << ", " << params.size()
-          << ");\n";
+    code_ << ind << CoreTypeToSubmitPrefix(core_type) << func_id << ", " << task_var << ");\n";
 
     task_counter_++;
   }
@@ -1058,15 +1056,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     code_ << "\n";
     code_ << ind << "// Group " << group_name << ": MixedKernels (AIC + AIV)\n";
-    code_ << ind << "PTOParam " << task_var << "[] = {\n";
+    code_ << ind << "PTOParam " << task_var << ";\n";
     for (const auto& p : params) {
-      code_ << ind << "    " << p.kind << "(" << p.value << "),\n";
+      code_ << ind << task_var << "." << p.kind << "(" << p.value << ");\n";
     }
-    code_ << ind << "};\n";
     code_ << ind << "MixedKernels mixed_" << task_counter_ << " = {" << aic_id << ", " << aiv_id
           << ", INVALID_KERNEL_ID};\n";
-    code_ << ind << "pto2_rt_submit_task(rt, mixed_" << task_counter_ << ", " << task_var << ", "
-          << params.size() << ");\n";
+    code_ << ind << "pto2_rt_submit_task(" << RtArg() << "mixed_" << task_counter_ << ", " << task_var
+          << ");\n";
 
     task_counter_++;
   }
@@ -1117,15 +1114,20 @@ class OrchestrationStmtCodegen : public CodegenBase {
       INTERNAL_CHECK(elem.index >= 0 && static_cast<size_t>(elem.index) < out_indices.size())
           << "Internal error: tuple element index " << elem.index << " out of range for " << call->op_->name_
           << " (has " << out_indices.size() << " Out/InOut params)";
+      size_t param_idx = out_indices[static_cast<size_t>(elem.index)];
+      // InOut params are already the external tensor (modified in-place); no alias needed.
+      if (callee->param_directions_[param_idx] == ParamDirection::InOut) {
+        continue;
+      }
       std::string elem_name = ReserveVarEmitName(elem.var);
-      EmitTensorAlias(elem_name, call, out_indices[static_cast<size_t>(elem.index)]);
+      EmitTensorAlias(elem_name, call, param_idx);
     }
   }
 
   // Visit a branch body (then/else) inside a PTO2_SCOPE, with return vars scoped.
   void VisitScopedBranchBody(const StmtPtr& body, const std::vector<VarPtr>& return_vars) {
     indent_ += 4;
-    code_ << Indent() << "PTO2_SCOPE(rt) {\n";
+    code_ << Indent() << "PTO2_SCOPE(" << ScopeArg() << ") {\n";
     indent_ += 4;
 
     auto saved = current_return_vars_;
@@ -1165,7 +1167,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     size_t ndim = result_type->shape_.size();
     size_t array_len = ndim == 0 ? 1 : ndim;
     std::ostringstream oss;
-    oss << "uint64_t " << emit_var << "_shapes[" << array_len << "] = {";
+    oss << "uint32_t " << emit_var << "_shapes[" << array_len << "] = {";
     if (ndim == 0) {
       oss << "1";
     } else {
@@ -1178,7 +1180,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     INTERNAL_CHECK(it->second.offset_tuple != nullptr)
         << "Internal error: tensor.assemble offset must be MakeTuple";
-    oss << "uint64_t " << emit_var << "_offsets[" << array_len << "] = {";
+    oss << "uint32_t " << emit_var << "_offsets[" << array_len << "] = {";
     if (ndim == 0) {
       oss << "0";
     } else {
@@ -1242,13 +1244,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::map<std::string, int>* func_name_to_id_;
   std::map<std::string, CoreType>* func_name_to_core_type_;
   int* next_func_id_;
-  // Unified name map: param + lineage alias (pre-built) + tensor.create/assemble (dynamic)
+  // VarPtr-based identity data
   std::unordered_map<const Var*, std::string> emit_name_map_;
-  // Param detection for ext_ prefix and arg_ ptr lookup
-  std::set<std::string> param_name_set_;
-  // String-based name reservation pool for ReserveUniqueName (initialized from param_name_set_)
-  std::set<std::string> declared_var_names_;
-  // Buffer root / assemble view optimization
+  std::set<std::string> declared_var_names_;  // Tracks all emitted names to prevent collisions
+  std::unordered_map<const Var*, const Var*> var_to_param_;
+  std::set<std::string> param_name_set_;                 // For string-only contexts (op codegen callbacks)
+  std::map<std::string, int> param_name_to_orch_index_;  // emit_name → orch[] index
   std::unordered_map<const Var*, const Var*> buffer_root_map_;
   std::unordered_map<const Var*, AssembleViewInfo> assemble_view_infos_;
   std::unordered_set<const Var*> non_optimizable_assemble_roots_;
@@ -1293,14 +1294,30 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   // Step 4a: Param name seed
   std::unordered_map<const Var*, std::string> emit_name_map;
   std::set<std::string> param_name_set;
+  std::map<std::string, int> param_name_to_orch_index;
   int tensor_param_count = 0;
+  // Collect scalar params in declaration order for OrchArg assignment after tensors
+  struct ScalarParamInfo {
+    std::string emit_name;
+    ScalarTypePtr scalar_type;
+  };
+  std::vector<ScalarParamInfo> scalar_params;
   for (const auto& var : func->params_) {
     std::string emit_name = GetSSABaseName(var->name_hint_);
     emit_name_map[var.get()] = emit_name;
     param_name_set.insert(emit_name);
     if (As<TensorType>(var->GetType())) {
+      param_name_to_orch_index[emit_name] = tensor_param_count;
       tensor_param_count++;
+    } else if (auto stype = As<ScalarType>(var->GetType())) {
+      scalar_params.push_back({emit_name, stype});
     }
+  }
+
+  // Scalar params occupy OrchArg slots after all tensor params
+  int scalar_param_start = tensor_param_count;
+  for (size_t i = 0; i < scalar_params.size(); ++i) {
+    param_name_to_orch_index[scalar_params[i].emit_name] = scalar_param_start + static_cast<int>(i);
   }
 
   // Step 4c: Lineage alias — map iter_args/return_vars to their param's emit name
@@ -1314,69 +1331,71 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   }
 
   // All external tensors come from params (including Out/InOut) — no return inference
-  int expected_arg_count = tensor_param_count;
+  int expected_arg_count = tensor_param_count + static_cast<int>(scalar_params.size());
 
   std::ostringstream oss;
 
   // 1. Includes
   oss << GenerateIncludes();
 
-  // 2. ARG defines (no separate return vars — all from params)
-  oss << GenerateArgDefines(func, {});
-
-  // 3. Helper functions
+  // 2. Helper functions
   oss << GenerateHelperFunctions();
 
-  // 4. extern "C" block
+  // 3. extern "C" block
   oss << "extern \"C\" {\n\n";
 
-  // 5. Config function
+  // 4. Config function
   oss << GenerateConfigFunction(expected_arg_count);
 
-  // 6. Entry function
+  // 5. Entry function
   oss << "__attribute__((visibility(\"default\")))\n";
-  oss << "void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, "
+  std::string rt_param = IsA5Backend() ? "PTO2Runtime* rt, " : "";
+  oss << "void aicpu_orchestration_entry(" << rt_param
+      << "OrchArg* orch, int arg_count, "
          "int orch_thread_num, int orch_thread_index) {\n";
   oss << "    (void)arg_count;\n";
   oss << "    (void)orch_thread_num;\n";
   oss << "    (void)orch_thread_index;\n\n";
 
-  // 7. Extract arguments (all from params — use GetCompatibleBaseName, not legacy stripping)
-  oss << "    // Extract device pointers\n";
-  for (const auto& var : func->params_) {
-    if (As<TensorType>(var->GetType())) {
-      std::string name = GetSSABaseName(var->name_hint_);
-      std::string upper_name = name;
-      for (auto& ch : upper_name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-      oss << "    void* arg_" << name << "_ptr = reinterpret_cast<void*>(args[ARG_PTR_" << upper_name
-          << "]);\n";
-    }
-  }
-
   // Create statement codegen (used for both external tensor generation and task submission)
   OrchestrationStmtCodegen stmt_codegen(program, &func_name_to_id, &func_name_to_core_type, &next_func_id,
-                                        std::move(emit_name_map), std::move(param_name_set));
+                                        std::move(emit_name_map), std::move(lineage.var_to_param),
+                                        std::move(param_name_set), std::move(param_name_to_orch_index));
   stmt_codegen.SetCallTupleElements(info_collector.call_tuple_elements);
   stmt_codegen.SetCallToTupleKey(info_collector.call_to_tuple_key);
   stmt_codegen.SetBufferRoots(buffer_info.buffer_roots);
   stmt_codegen.SetAssembleViewInfos(buffer_info.assemble_view_infos);
   stmt_codegen.SetNonOptimizableAssembleRoots(buffer_info.non_optimizable_assemble_roots);
 
-  // 8. External tensors (make_tensor_external with shape/dtype — all from params)
-  oss << "\n    // External tensors\n";
+  // 6. External tensors (from OrchArg — all from params)
+  oss << "    // External tensors\n";
+  int orch_idx = 0;
   for (const auto& var : func->params_) {
     auto tensor_type = As<TensorType>(var->GetType());
     if (tensor_type) {
-      std::string name = GetSSABaseName(var->name_hint_);
-      oss << GenerateMakeTensorExternal(name, "arg_" + name + "_ptr", tensor_type, stmt_codegen);
+      std::string name = auto_name::GetCompatibleBaseName(var->name_hint_);
+      oss << GenerateMakeTensorExternal(name, orch_idx, tensor_type, stmt_codegen);
+      orch_idx++;
     }
   }
 
-  // 9. Generate task submission code via statement codegen
+  // 7. Scalar params (from OrchArg — slots after tensors)
+  if (!scalar_params.empty()) {
+    oss << "\n    // Scalar params\n";
+    for (size_t i = 0; i < scalar_params.size(); ++i) {
+      int scalar_orch_idx = scalar_param_start + static_cast<int>(i);
+      oss << GenerateScalarUnpack(scalar_params[i].emit_name, scalar_orch_idx, scalar_params[i].scalar_type);
+    }
+  }
+
+  // 9. Generate task submission code wrapped in top-level PTO2_SCOPE
+  stmt_codegen.SetInitialIndent(8);
   stmt_codegen.VisitStmt(func->body_);
 
-  // 10. Append statement codegen output
-  oss << "\n" << stmt_codegen.GetGeneratedCode();
+  // 10. Emit generated code inside PTO2_SCOPE (required by runtime: scope_stack_top must be >= 0)
+  oss << "\n    PTO2_SCOPE(" << ScopeArg() << ") {\n";
+  oss << stmt_codegen.GetGeneratedCode();
+  oss << "    }\n";
 
   oss << "}\n\n";
   oss << "}  // extern \"C\"\n";

@@ -59,7 +59,7 @@ static std::string CalculateTensorSizeExpr(const TensorTypePtr& tensor_type, Cod
 }
 
 REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
-  // tensor.create -> uint64_t var_shapes[N] = {...}; Tensor var = make_tensor(var_shapes, N, DataType::XX);
+  // tensor.create -> uint32_t var_shapes[N] = {...}; Tensor var = make_tensor(var_shapes, N, DataType::XX);
   auto result_type = As<TensorType>(op->GetType());
   CHECK(result_type) << "tensor.create must return TensorType";
 
@@ -67,7 +67,7 @@ REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
   size_t ndim = result_type->shape_.size();
 
   std::ostringstream oss;
-  oss << "uint64_t " << result_var << "_shapes[" << ndim << "] = {";
+  oss << "uint32_t " << result_var << "_shapes[" << ndim << "] = {";
   for (size_t i = 0; i < ndim; ++i) {
     if (i > 0) oss << ", ";
     oss << codegen.GenerateExprString(result_type->shape_[i]);
@@ -214,7 +214,7 @@ REGISTER_ORCHESTRATION_OP(tensor_slice, ("tensor.slice")) {
   std::ostringstream oss;
 
   // Generate shape array
-  oss << "uint64_t " << result_var << "_shapes[" << ndim << "] = {";
+  oss << "uint32_t " << result_var << "_shapes[" << ndim << "] = {";
   for (size_t i = 0; i < ndim; ++i) {
     if (i > 0) oss << ", ";
     oss << codegen.GenerateExprString(shape_tuple->elements_[i]);
@@ -222,7 +222,7 @@ REGISTER_ORCHESTRATION_OP(tensor_slice, ("tensor.slice")) {
   oss << "};\n";
 
   // Generate offset array
-  oss << "uint64_t " << result_var << "_offsets[" << ndim << "] = {";
+  oss << "uint32_t " << result_var << "_offsets[" << ndim << "] = {";
   for (size_t i = 0; i < ndim; ++i) {
     if (i > 0) oss << ", ";
     oss << codegen.GenerateExprString(offset_tuple->elements_[i]);
@@ -261,7 +261,21 @@ REGISTER_ORCHESTRATION_OP(tensor_dim, ("tensor.dim")) {
   INTERNAL_CHECK(axis >= 0 && axis < rank) << "Internal error: tensor.dim axis out of range";
 
   std::string result_var = codegen.GetCurrentResultTarget();
-  std::string dim_expr = codegen.GenerateExprString(tensor_type->shape_[axis]);
+
+  // For a compile-time constant dim, emit the literal directly.
+  // For a dynamic dim (e.g. pl.dynamic("M")), GenerateExprString returns the
+  // dynamic var name (e.g. "M"), which is not a valid C++ identifier in the
+  // orchestration scope.  Read the runtime shape from the OrchArg instead.
+  std::string dim_expr;
+  if (As<ConstInt>(tensor_type->shape_[axis])) {
+    dim_expr = codegen.GenerateExprString(tensor_type->shape_[axis]);
+  } else {
+    std::string tensor_name = codegen.TryGetVarName(op->args_[0]);
+    CHECK(!tensor_name.empty()) << "tensor.dim: cannot resolve tensor name from first argument";
+    dim_expr = codegen.GetTensorShapeDim(tensor_name, axis);
+    CHECK(!dim_expr.empty()) << "tensor.dim: GetTensorShapeDim not supported for '" << tensor_name
+                             << "' in this codegen context";
+  }
 
   std::ostringstream oss;
   oss << "int64_t " << result_var << " = " << dim_expr << ";";

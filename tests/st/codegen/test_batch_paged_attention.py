@@ -123,7 +123,7 @@ class BatchQKMatmulTestCase(PTOTestCase):
             def KernelQkMatmul(
                 self,
                 query: pl.Tensor[[query_rows, head_dim], pl.BF16],
-                key_cache: pl.Tensor[[head_dim, key_cache_rows], pl.BF16, pl.DN],
+                key_cache: pl.Tensor[[key_cache_rows, head_dim], pl.BF16],
                 sij_batch: pl.Out[pl.Tensor[[batch_q_tile, block_size], pl.FP32]],
                 block_table: pl.Tensor[[block_table_flat_size], pl.INT32],
                 batch_count: pl.Scalar[pl.INDEX],
@@ -160,7 +160,7 @@ class BatchQKMatmulTestCase(PTOTestCase):
             def Orchestrator(
                 self,
                 query: pl.Tensor[[query_rows, head_dim], pl.BF16],
-                key_cache: pl.Tensor[[head_dim, key_cache_rows], pl.BF16, pl.DN],
+                key_cache: pl.Tensor[[key_cache_rows, head_dim], pl.BF16],
                 block_table: pl.Tensor[[block_table_flat_size], pl.INT32],
                 config: pl.Tensor[[5], pl.INT64],
                 sij_batch: pl.Out[pl.Tensor[[batch_q_tile, block_size], pl.FP32]],
@@ -245,6 +245,12 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
     def get_name(self) -> str:
         return f"batch_softmax_prepare_{self.batch}b_{self.block_size}bs_bi{self.block_idx}"
 
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def get_backend_type(self) -> BackendType:
+        return BackendType.Ascend910B_PTO
+
     def define_tensors(self) -> list[TensorSpec]:
         batch_q_tile = self.batch * self.q_tile
 
@@ -265,6 +271,7 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
         batch = self.batch
         block_size = self.block_size
         q_tile = self.q_tile
+        block_idx = self.block_idx
 
         batch_q_tile = batch * q_tile
 
@@ -275,19 +282,17 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
                 self,
                 sij_batch: pl.Tensor[[batch_q_tile, block_size], pl.FP32],
                 pij_batch: pl.Out[pl.Tensor[[batch_q_tile, block_size], pl.BF16]],
-                mij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32]],
-                lij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32]],
+                mij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN]],
+                lij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN]],
                 scale_value: pl.Scalar[pl.FP32],
                 context_lens: pl.Tensor[[batch], pl.INT32],
-                batch_count: pl.Scalar[pl.INT64],
-                block_idx: pl.Scalar[pl.INT64],
             ) -> tuple[
                 pl.Tensor[[batch_q_tile, block_size], pl.BF16],
-                pl.Tensor[[batch_q_tile, 1], pl.FP32],
-                pl.Tensor[[batch_q_tile, 1], pl.FP32],
+                pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN],
+                pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN],
             ]:
-                for b in pl.range(batch_count):
-                    cur_seq = pl.read(context_lens, b)
+                for b in pl.range(batch):
+                    cur_seq = pl.tensor.read(context_lens, [b])
                     start = block_idx * block_size
                     remaining = cur_seq - start
                     valid_len = pl.max(pl.min(remaining, block_size), 0)
@@ -299,9 +304,9 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
                         valid_shapes=[q_tile, valid_len],
                         target_memory=pl.MemorySpace.Vec,
                     )
-                    s_tile = pl.tile.fillpad(s_tile)
+                    s_padded = pl.tile.fillpad(s_tile, pad_value=pl.PadValue.min)
 
-                    scaled = pl.mul(s_tile, scale_value)
+                    scaled = pl.mul(s_padded, scale_value)
                     tmp_tile = pl.create_tile(
                         [q_tile, block_size],
                         dtype=pl.FP32,
@@ -314,9 +319,9 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
                     pij_tile = pl.cast(pij_tile_f16, target_type=pl.FP32)
                     li_tile = pl.row_sum(pij_tile, tmp_tile)
 
-                    pij_batch = pl.store(pij_tile_f16, [b * q_tile, 0], [q_tile, block_size], pij_batch)
-                    mij_batch = pl.store(mi_tile, [b * q_tile, 0], [q_tile, 1], mij_batch)
-                    lij_batch = pl.store(li_tile, [b * q_tile, 0], [q_tile, 1], lij_batch)
+                    pij_batch = pl.store(pij_tile_f16, [b * q_tile, 0], pij_batch)
+                    mij_batch = pl.store(mi_tile, [b * q_tile, 0], mij_batch)
+                    lij_batch = pl.store(li_tile, [b * q_tile, 0], lij_batch)
                 return pij_batch, mij_batch, lij_batch
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -327,15 +332,13 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
                 scale_config: pl.Tensor[[1], pl.FP32],
                 config: pl.Tensor[[2], pl.INT64],
                 pij_batch: pl.Out[pl.Tensor[[batch_q_tile, block_size], pl.BF16]],
-                mij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32]],
-                lij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32]],
+                mij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN]],
+                lij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN]],
             ) -> tuple[
                 pl.Tensor[[batch_q_tile, block_size], pl.BF16],
-                pl.Tensor[[batch_q_tile, 1], pl.FP32],
-                pl.Tensor[[batch_q_tile, 1], pl.FP32],
+                pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN],
+                pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN],
             ]:
-                batch_count: pl.Scalar[pl.INT64] = pl.tensor.read(config, [0])
-                block_idx: pl.Scalar[pl.INT64] = pl.tensor.read(config, [1])
                 scale_value: pl.Scalar[pl.FP32] = pl.tensor.read(scale_config, [0])
 
                 pij_batch, mij_batch, lij_batch = self.KernelSoftmaxPrepare(
@@ -345,8 +348,6 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
                     lij_batch,
                     scale_value,
                     context_lens,
-                    batch_count,
-                    block_idx,
                 )
                 return pij_batch, mij_batch, lij_batch
 
@@ -378,11 +379,11 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
             s_scaled = s * scale_value
             mi = s_scaled.max(dim=1, keepdim=True).values
             pij = torch.exp(s_scaled - mi)
-            pij_f16 = pij.to(torch.float16)
-            pij_f32 = pij_f16.float()
+            pij_bf16 = pij.to(torch.bfloat16)
+            pij_f32 = pij_bf16.float()
             li = pij_f32.sum(dim=1, keepdim=True)
 
-            tensors["pij_batch"][b * q_tile : (b + 1) * q_tile, :] = pij_f16
+            tensors["pij_batch"][b * q_tile : (b + 1) * q_tile, :] = pij_bf16
             tensors["mij_batch"][b * q_tile : (b + 1) * q_tile, :] = mi
             tensors["lij_batch"][b * q_tile : (b + 1) * q_tile, :] = li
 
@@ -1012,7 +1013,6 @@ class TestBatchPagedAttentionKernels:
         result = test_runner.run(test_case)
         assert result.passed, f"Batch QK matmul test failed: {result.error}"
 
-    @pytest.mark.skip(reason="Under debugging and fixing")
     @pytest.mark.parametrize(
         "batch,block_size,block_idx,context_lens",
         [

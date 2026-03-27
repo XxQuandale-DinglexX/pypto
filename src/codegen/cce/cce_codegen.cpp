@@ -91,12 +91,14 @@ std::map<std::string, std::string> CCECodegen::Generate(const ir::ProgramPtr& pr
     oss << KERNEL_HEADER << "\n";
 
     // Add compute_stride helper function
-    oss << "// Helper function to compute stride from raw_shapes\n";
+    oss << "// Helper function to compute stride, respecting is_raw_eq_shapes flag\n";
     oss << "__aicore__ __attribute__((always_inline)) inline int64_t compute_stride(\n";
     oss << "    __gm__ TensorData* tensor, int dim) {\n";
     oss << "  int64_t stride = 1;\n";
+    oss << "  const __gm__ uint32_t* rs =\n";
+    oss << "      tensor->is_raw_eq_shapes ? tensor->shapes : tensor->raw_shapes;\n";
     oss << "  for (int j = dim + 1; j < static_cast<int>(tensor->ndims); j++) {\n";
-    oss << "    stride *= static_cast<int64_t>(tensor->raw_shapes[j]);\n";
+    oss << "    stride *= static_cast<int64_t>(rs[j]);\n";
     oss << "  }\n";
     oss << "  return stride;\n";
     oss << "}\n\n";
@@ -193,7 +195,18 @@ void CCECodegen::GeneratePrologue(const ir::FunctionPtr& func) {
 
   emitter_.EmitLine("// Unpack arguments and type declarations");
 
+  // New PTOParam dispatch order: tensors first, then scalars.
+  // Pre-compute the args index for each parameter based on this ordering.
+  size_t scalar_start_idx = 0;
+  for (const auto& param : func->params_) {
+    if (std::dynamic_pointer_cast<const ir::TensorType>(param->GetType())) {
+      scalar_start_idx++;
+    }
+  }
+
   // First pass: Unpack arguments
+  size_t tensor_idx = 0;
+  size_t scalar_idx = scalar_start_idx;
   for (size_t i = 0; i < func->params_.size(); ++i) {
     const auto& param = func->params_[i];
     const std::string param_name = context_.SanitizeName(param);
@@ -203,10 +216,10 @@ void CCECodegen::GeneratePrologue(const ir::FunctionPtr& func) {
       // Extract element type
       std::string element_type = tensor_type->dtype_.ToCTypeString();
 
-      // Emit argument unpacking via TensorData* indirection
+      // Emit argument unpacking via TensorData* indirection (tensors come first)
       std::string tensor_var = param_name + "_tensor";
       emitter_.EmitLine("__gm__ TensorData* " + tensor_var + " = reinterpret_cast<__gm__ TensorData*>(args[" +
-                        std::to_string(i) + "]);");
+                        std::to_string(tensor_idx) + "]);");
       emitter_.EmitLine("__gm__ " + element_type + "* " + param_name + " = reinterpret_cast<__gm__ " +
                         element_type + "*>(" + tensor_var + "->buffer.addr) + " + tensor_var +
                         "->start_offset;");
@@ -214,18 +227,20 @@ void CCECodegen::GeneratePrologue(const ir::FunctionPtr& func) {
       // Register pointer/struct by IR var name for later lookup in tile.load/store
       context_.RegisterPointer(param->name_hint_, param_name);
       context_.RegisterTensorStruct(param->name_hint_, tensor_var);
+      tensor_idx++;
     } else if (auto scalar_type = std::dynamic_pointer_cast<const ir::ScalarType>(param->GetType())) {
       // Generate scalar type declaration
       std::string cpp_type = scalar_type->dtype_.ToCTypeString();
 
-      // Emit argument unpacking via union converter
+      // Emit argument unpacking via union converter (scalars come after all tensors)
       std::string conv_name = param_name + "_conv";
       emitter_.EmitLine("union { uint64_t u64; " + cpp_type + " val; } " + conv_name + ";");
-      emitter_.EmitLine(conv_name + ".u64 = args[" + std::to_string(i) + "];");
+      emitter_.EmitLine(conv_name + ".u64 = args[" + std::to_string(scalar_idx) + "];");
       emitter_.EmitLine(cpp_type + " " + param_name + " = " + conv_name + ".val;");
 
       // Register scalar variable
       context_.RegisterVar(param, param_name);
+      scalar_idx++;
     } else {
       throw pypto::RuntimeError("Unsupported parameter type in function " + func->name_);
     }
@@ -261,6 +276,20 @@ void CCECodegen::GenerateBody(const ir::FunctionPtr& func) {
   emitter_.EmitLine("// Function body");
   if (func->body_) {
     VisitStmt(func->body_);
+  }
+
+  // Emit pipeline completion sync before returning.
+  // This ensures all in-flight pipe operations finish before the kernel returns,
+  // so the runtime can safely read back results.
+  auto core_type = InferFunctionCoreType(func);
+  if (core_type == ir::CoreType::VECTOR) {
+    // AIV: wait for MTE3 (store pipeline) to complete
+    emitter_.EmitLine("set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);");
+    emitter_.EmitLine("wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);");
+  } else {
+    // AIC: wait for FIX (cube unit pipeline) to complete
+    emitter_.EmitLine("set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);");
+    emitter_.EmitLine("wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);");
   }
 
   emitter_.DecreaseIndent();

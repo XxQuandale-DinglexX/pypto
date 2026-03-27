@@ -157,16 +157,16 @@ def BuildBatchPagedAttentionProgram(
             self,
             sij_batch: pl.Tensor[[batch_q_tile, block_size], pl.FP32],
             pij_batch: pl.Out[pl.Tensor[[batch_q_tile, block_size], pl.BF16]],
-            mij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32]],
-            lij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32]],
+            mij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN]],
+            lij_batch: pl.Out[pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN]],
             scale_value: pl.Scalar[pl.FP32],
             context_lens: pl.Tensor[[batch], pl.INT32],
             batch_count: pl.Scalar[pl.INT64],
             block_idx: pl.Scalar[pl.INT64],
         ) -> tuple[
             pl.Tensor[[batch_q_tile, block_size], pl.BF16],
-            pl.Tensor[[batch_q_tile, 1], pl.FP32],
-            pl.Tensor[[batch_q_tile, 1], pl.FP32],
+            pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN],
+            pl.Tensor[[batch_q_tile, 1], pl.FP32, pl.DN],
         ]:
             """Softmax prepare: scale, row_max, exp, row_sum (VECTOR, func_id=1).
 
@@ -184,13 +184,12 @@ def BuildBatchPagedAttentionProgram(
                     [b * q_tile, 0],
                     [q_tile, block_size],
                     target_memory=pl.MemorySpace.Vec,
+                    valid_shapes=[q_tile, valid_len],
                 )
 
-                # Keep the allocated tile static and narrow only the logical valid columns.
-                sij_dyn = pl.tile.slice(s_tile, [q_tile, block_size], [0, 0], valid_shape=[q_tile, valid_len])
-                s_tile = pl.tile.fillpad(sij_dyn)
+                s_padded = pl.tile.fillpad(s_tile, pad_value=pl.PadValue.min)
 
-                scaled = pl.mul(s_tile, scale_value)
+                scaled = pl.mul(s_padded, scale_value)
                 tmp_tile = pl.create_tile(
                     [q_tile, block_size],
                     dtype=pl.FP32,

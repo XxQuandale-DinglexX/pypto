@@ -116,6 +116,20 @@ class CodegenBase : public ir::IRVisitor {
   [[nodiscard]] virtual std::string GetExternalTensorName(const std::string& name) const { return name; }
 
   /**
+   * @brief Get the C++ expression for a tensor parameter's runtime shape at a given axis
+   *
+   * For orchestration codegen, returns e.g. "(int64_t)orch[N].tensor.shapes[axis]".
+   * Subclasses that do not support runtime shape access may return an empty string.
+   *
+   * @param tensor_name Tensor parameter name (e.g., "a")
+   * @param axis Dimension index
+   * @return C++ expression string, or empty string if not supported
+   */
+  [[nodiscard]] virtual std::string GetTensorShapeDim(const std::string& tensor_name, int64_t axis) const {
+    return "";
+  }
+
+  /**
    * @brief Get the runtime DataType enum string for generated code
    *
    * Returns the fully qualified DataType enum name as used by the runtime

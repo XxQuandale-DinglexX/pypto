@@ -125,6 +125,7 @@ set(PYPTO_SOURCES
     src/ir/arith/canonical_simplify.cpp
     src/ir/arith/ir_mutator_with_analyzer.cpp
     src/ir/arith/transitive_comparison_analyzer.cpp
+    src/ir/arith/int_set.cpp
 
     # IR - Transforms
     src/ir/transforms/allocate_memory_addr_pass.cpp
@@ -157,7 +158,12 @@ set(PYPTO_SOURCES
     src/ir/transforms/unroll_loops_pass.cpp
     src/ir/transforms/structural_equal.cpp
     src/ir/transforms/structural_hash.cpp
+    src/ir/transforms/utils/core_affinity.cpp
+    src/ir/transforms/utils/cross_core_pipe.cpp
     src/ir/transforms/utils/deep_clone_utils.cpp
+    src/ir/transforms/utils/dead_code_elimination.cpp
+    src/ir/transforms/utils/loop_state_repair.cpp
+    src/ir/transforms/utils/tpop_chain_normalizer.cpp
     src/ir/transforms/utils/normalize_stmt_structure.cpp
     src/ir/transforms/utils/parent_stmt_analysis.cpp
     src/ir/transforms/utils/transform_utils.cpp
@@ -171,6 +177,7 @@ set(PYPTO_SOURCES
     # IR - Verifier
     src/ir/verifier/verifier.cpp
     src/ir/verifier/property_verifier_registry.cpp
+    src/ir/verifier/mixed_kernel_expanded_verifier.cpp
     src/ir/verifier/verify_ssa_pass.cpp
     src/ir/verifier/verify_no_nested_call_pass.cpp
     src/ir/verifier/verify_break_continue_pass.cpp
@@ -193,6 +200,10 @@ set(PYPTO_SOURCES
     src/codegen/orchestration/orchestration_codegen.cpp
     src/codegen/orchestration_op_registry.cpp
     src/codegen/pto/pto_codegen.cpp
+    src/codegen/pto/pto_control_flow_codegen.cpp
+    src/codegen/pto/pto_scalar_expr_codegen.cpp
+    src/codegen/pto/pto_type_utils.cpp
+    src/codegen/pto/tpop_chain_reorder.cpp
     src/codegen/distributed/distributed_codegen.cpp
     src/codegen/tensor_op_codegen.cpp
 
