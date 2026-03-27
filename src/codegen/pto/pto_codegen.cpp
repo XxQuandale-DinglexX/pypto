@@ -473,6 +473,20 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
           layout_DN = true;
         }
       }
+      // 2D column vectors ([N, 1] with N > 1) produce degenerate strides
+      // [1, 1] under nd layout.  ptoas infers dn for such strides, so match
+      // its inference.  Exclude [1, 1] scalars: they are not true column
+      // vectors and forcing dn breaks ops like trowexpandmul that require
+      // row-major destinations.
+      if (!layout_DN && tensor_type->shape_.size() == 2 && !As<ir::Var>(tensor_type->shape_[1])) {
+        if (GetConstIntValue(tensor_type->shape_[1]) == 1) {
+          bool is_scalar = !As<ir::Var>(tensor_type->shape_[0]) &&
+                           GetConstIntValue(tensor_type->shape_[0]) == 1;
+          if (!is_scalar) {
+            layout_DN = true;
+          }
+        }
+      }
 
       // For N-D (N > 2): pre-compute row-major strides as SSA values using arith.muli
       // so that dynamic dimensions (ir::Var) are handled correctly. Emit any needed
@@ -535,7 +549,7 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
       }
       stream_ << "]";
 
-      std::string layout_str = "nd";
+      std::string layout_str = layout_DN ? "dn" : "nd";
       if (tensor_type->tensor_view_.has_value()) {
         switch (tensor_type->tensor_view_.value().layout) {
           case ir::TensorLayout::DN:
