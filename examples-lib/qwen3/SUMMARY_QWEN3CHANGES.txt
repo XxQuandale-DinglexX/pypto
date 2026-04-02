@@ -1,0 +1,213 @@
+================================================================================
+SUMMARY OF CHANGES: qwen-src/ → qwen3/
+================================================================================
+
+This document summarizes all differences between the original files in
+examples-lib/qwen-src/ and the adapted files in examples-lib/qwen3/.
+
+File mapping:
+  qwen-src/qwen3-32b.py                              → qwen3/qwen3_32b_new.py
+  qwen-src/qwen3_32b_prefill.py                      → qwen3/qwen3_32b_prefill_new.py
+  qwen-src/qwen3_32b_prefill_tilelet.py               → qwen3/qwen3_32b_prefill_tilelet_new.py
+  qwen-src/qwen3_32b_decode.py                       → qwen3/qwen3_32b_decode_new.py
+  qwen-src/qwen3_32b_decode_scope2.py                → qwen3/qwen3_32b_decode_scope2_new.py
+  qwen-src/qwen3_32b_decode_tilelet.py               → qwen3/qwen3_32b_decode_tilelet_new.py
+  qwen-src/qwen3_32b_training_forward_and_backward.py → qwen3/qwen3_32b_training_forward_and_backward_new.py
+
+
+================================================================================
+1. CROSS-CUTTING CHANGES (applied to most or all files)
+================================================================================
+
+1.1  Backend / RunConfig
+  - BackendType changed: CCE → Ascend950.
+  - RunConfig field changes: removed work_dir=, added save_kernels=True and
+    save_kernels_dir=work_dir.
+  - compile_and_run now returns early when "code_runner" is in result.error
+    (print compile-OK message only, no double-printing).
+
+1.2  pl.full / pl.concat removed
+  - pl.full(..., value=0.0) replaced by pl.create_tensor(...) + pl.mul(..., 0.0).
+  - pl.concat replaced by pl.create_tensor + pl.assemble at column offsets
+    (used in RoPE construction).
+
+1.3  pl.reshape for 3D→2D slicing
+  - When slicing from 3D tensors (hidden_states, target_states), the new code
+    uses a 3D slice shape [1, TOK_TILE, CHUNK] then pl.reshape to [TOK_TILE,
+    CHUNK], instead of slicing directly as 2D.
+
+1.4  Error handling
+  - compile_and_run returns immediately after printing "COMPILE OK — device run
+    skipped" on code_runner-missing path, preventing double error output.
+
+
+================================================================================
+2. qwen3-32b.py → qwen3_32b_new.py  (Decode, single-layer)
+================================================================================
+
+2.1  Constants
+  - SEQ_TILE: 120 → 64.
+  - New: Q_HEAD_BATCH = 8, Q_HEAD_PAD = 16 (grouped Q-heads + cube padding).
+
+2.2  Scope 2 — K path (cache write)
+  - Old: per-head parallel loop (pl.parallel with chunk=4), per-head [1, HEAD_DIM]
+    RoPE with create_tensor + assemble halves, direct k_cache/v_cache assemble.
+  - New: three staged pl.incore() blocks:
+    (1) Build k_group [NUM_KV_HEADS, HEAD_DIM] FP32 from k_proj.
+    (2) Batched RoPE on k_group → k_rot_tensor.
+    (3) Loop ki: write k_rot_tensor rows to k_cache, v_proj to v_cache.
+
+2.3  Scope 2 — Attention (GQA grouping)
+  - Old: pl.parallel over heads (chunk=8); per-head [1, HEAD_DIM] Q, RoPE,
+    online softmax with [1, HEAD_DIM]/[1,1] accumulators.
+  - New: pl.parallel over TOTAL_Q_GROUPS (no chunk); each group processes
+    Q_HEAD_BATCH=8 heads sharing one KV head.
+  - Q padded to [Q_HEAD_PAD, HEAD_DIM] for cube fractal alignment.
+  - Online softmax accumulators: [Q_HEAD_BATCH, HEAD_DIM], [Q_HEAD_BATCH, 1].
+  - QK matmul: padded Q × K with b_trans=True → FP32 scores.
+  - Softmax: fillpad(min) then scale (scale moved after pad); BF16 round-trip
+    on exp for cur_li computation.
+  - SV matmul: padded exp × V → slice result to [Q_HEAD_BATCH, HEAD_DIM].
+  - Write back: pl.reshape ctx to [1, Q_HEAD_BATCH * HEAD_DIM], assemble at
+    q_base * HEAD_DIM offset.
+
+2.4  Scope 2 — Wrapping
+  - Old: one large pl.auto_incore() around entire attention.
+  - New: many explicit pl.incore() stages (avoids MixedKernelExpanded issues).
+
+2.5  Batch loop
+  - pl.parallel(0, BATCH, 1, chunk=4) → pl.parallel(BATCH).
+
+2.6  New helpers
+  - build_tensor_specs, compile_and_run, __main__ block added (old file had
+    none of these).
+
+
+================================================================================
+3. qwen3_32b_prefill.py → qwen3_32b_prefill_new.py
+================================================================================
+
+  - Kernel/graph: identical (byte-for-byte same PyPTO program).
+  - Only changes:
+    (a) import os added.
+    (b) compile_and_run gains optional work_dir parameter.
+    (c) RunConfig adds save_kernels=True, save_kernels_dir=work_dir.
+    (d) Default work_dir derived from __file__ path (qwen3_32b_prefill_dump).
+
+
+================================================================================
+4. qwen3_32b_prefill_tilelet.py → qwen3_32b_prefill_tilelet_new.py
+================================================================================
+
+  - Only change in kernel: RoPE construction.
+    Old: pl.concat(low_half, high_half) for both K and Q RoPE.
+    New: pl.create_tensor + two pl.assemble calls at column offsets [0,0] and
+         [0, HEAD_DIM//2].
+  - Rest of kernel (Scope 1, attention, Scope 3): unchanged.
+  - Helpers/RunConfig: unchanged.
+
+
+================================================================================
+5. qwen3_32b_decode.py → qwen3_32b_decode_new.py
+================================================================================
+
+  Same changes as section 2 (qwen3-32b.py → qwen3_32b_new.py):
+  - SEQ_TILE 120 → 64, Q_HEAD_BATCH=8, Q_HEAD_PAD=16.
+  - K path: parallel per-head → staged incore batched RoPE.
+  - Attention: per-head → grouped Q with padding, fillpad softmax, BF16 exp
+    round-trip, first-seq-block special-case for online softmax.
+  - Wrapping: auto_incore → explicit incore stages.
+  - compile_and_run: early return on code_runner-missing.
+
+
+================================================================================
+6. qwen3_32b_decode_scope2.py → qwen3_32b_decode_scope2_new.py
+================================================================================
+
+  - Only change in kernel: oi/li/mi accumulator initialization.
+    Old: pl.full([...], value=0.0) + pl.reshape for li/mi.
+    New: pl.create_tensor outside incore, then pl.mul(..., 0.0) inside incore.
+  - compile_and_run: early return on code_runner-missing (no double-print).
+
+
+================================================================================
+7. qwen3_32b_decode_tilelet.py → qwen3_32b_decode_tilelet_new.py
+================================================================================
+
+  - Same accumulator init change as decode_scope2 (pl.full → create_tensor +
+    mul(0.0)).
+  - Removed unused backend variable from compile_and_run.
+  - compile_and_run: early return on code_runner-missing.
+
+
+================================================================================
+8. qwen3_32b_training_forward_and_backward.py →
+   qwen3_32b_training_forward_and_backward_new.py
+================================================================================
+
+8.1  Constants (scaled down for testing)
+  - BATCH: 64 → 1.
+  - MAX_SEQ: 4096 → 4.
+  - HIDDEN: 5120 → 80.
+  - INTERMEDIATE: 25600 → 400.
+  - K_CHUNK: 64 → 4.
+  - Q_OUT_CHUNK: 128 → 8.
+  - MLP_OUT_CHUNK: 256 → 16.
+
+8.2  Scratch buffers
+  - New: muon_scratch [MLP_OUT_CHUNK, MLP_OUT_CHUNK] BF16.
+  - New: proxy_scratch [TOK_TILE, MLP_OUT_CHUNK] BF16.
+  - New: btrans_scratch [TOK_TILE, K_CHUNK] FP32.
+  (Used for staging data for matmul transpose patterns.)
+
+8.3  Forward pass
+  - Input RMSNorm: reshape-after-slice pattern for 3D tensors.
+  - Attention scores: k_c staged via btrans_scratch (assemble/slice) before
+    matmul with b_trans=True.
+  - Attention context: explicit ctx_acc zeroed + add(ctx_acc, matmul(...))
+    instead of direct fused matmul.
+  - O projection residual: reshape-after-slice for hidden_states.
+
+8.4  Loss accumulation
+  - Old: per-token loop with tensor.read and [1,1] scalar tensors.
+  - New: vector add with [TOK_TILE, 1] accumulator (loss_prev + sq_row).
+
+8.5  Backward pass
+  - MLP backward: d_mlp cast to BF16 before matmul with w_down chunk.
+  - Gate/up gradients: d_gate_bf16 / d_up_bf16 intermediate BF16 casts,
+    sequential add pattern instead of fused add(add(matmul, matmul)).
+  - Attention backward: v_c renamed to v_bwd.
+
+8.6  Weight gradients + Muon optimizer (major rewrite)
+  - proxy_scratch used to stage proxy tensors for a_trans matmul patterns.
+  - Stage 1 (w_down): tiled gram matrix computation via muon_scratch
+    (MLP_OUT_CHUNK//TOK_TILE iterations, slice/transpose/matmul per tile).
+  - Stage 2 (wo/wq/wk/wv): proxy_ctx and proxy_n staged via proxy_scratch;
+    tiled gram with K_CHUNK//TOK_TILE iterations.
+  - Stage 3 (w_gate/w_up): different NS formulation — builds ns_acc via
+    matmul(muon_bf, transpose(tile)) then matmul(tmp_bf, tile) instead of
+    computing gram then muon @ gram.
+
+8.7  Backend
+  - BackendType.CCE → BackendType.Ascend950.
+  - save_kernels / save_kernels_dir added to RunConfig.
+
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+File pair                  | Key changes
+---------------------------+-----------------------------------------------------
+qwen3-32b → _new           | SEQ_TILE 120→64, grouped Q (Q_HEAD_BATCH=8),
+                           | multi-stage incore, fillpad softmax, helpers added
+prefill → _new             | save_kernels config only
+prefill_tilelet → _new     | RoPE: concat → create_tensor+assemble
+decode → _new              | Same as qwen3-32b (grouped Q, staged incore, etc.)
+decode_scope2 → _new       | Accumulator init: full → create_tensor+mul
+decode_tilelet → _new      | Accumulator init: full → create_tensor+mul
+training_fwd_bwd → _new    | Scaled constants, scratch buffers, reshape-after-
+                           | slice, tiled Muon NS, vector loss, Ascend950
+---------------------------+-----------------------------------------------------
+All files                  | CCE→Ascend950, save_kernels, early return on
+                           | code_runner error, pl.full removed
