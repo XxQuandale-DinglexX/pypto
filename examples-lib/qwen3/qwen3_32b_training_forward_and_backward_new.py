@@ -102,7 +102,7 @@ def build_qwen3_32b_training_forward_backward_program(
             grad_w_up: pl.Tensor[[HIDDEN_CFG, INTER_CFG], pl.FP32],
             grad_w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.FP32],
             out: pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16],
-            loss_out: pl.Tensor[[1], pl.FP32],
+            loss_out: pl.Tensor[[TOK_TILE, 1], pl.FP32],
         ) -> tuple[
             pl.Tensor[[HIDDEN_CFG, HIDDEN_CFG], pl.FP32],
             pl.Tensor[[HIDDEN_CFG, HIDDEN_CFG], pl.FP32],
@@ -119,33 +119,53 @@ def build_qwen3_32b_training_forward_backward_program(
             pl.Tensor[[HIDDEN_CFG, INTER_CFG], pl.FP32],
             pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.FP32],
             pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16],
-            pl.Tensor[[1], pl.FP32],
+            pl.Tensor[[TOK_TILE, 1], pl.FP32],
         ]:
-            muon_scratch = pl.create_tensor(
-                [MLP_OUT_CHUNK, MLP_OUT_CHUNK], dtype=pl.BF16
+            loss_acc = pl.create_tensor([TOK_TILE, 1], dtype=pl.FP32)
+            muon_buf = pl.create_tensor(
+                [MLP_OUT_CHUNK, MLP_OUT_CHUNK], dtype=pl.FP32
             )
-            proxy_scratch = pl.create_tensor(
-                [TOK_TILE, MLP_OUT_CHUNK], dtype=pl.BF16
-            )
-            btrans_scratch = pl.create_tensor(
-                [TOK_TILE, K_CHUNK], dtype=pl.FP32
-            )
-            with pl.auto_incore():
+
+            with pl.incore():
                 grad_wq = pl.mul(grad_wq, 0.0)
                 grad_wk = pl.mul(grad_wk, 0.0)
                 grad_wv = pl.mul(grad_wv, 0.0)
                 grad_wo = pl.mul(grad_wo, 0.0)
-                grad_w_gate = pl.mul(grad_w_gate, 0.0)
-                grad_w_up = pl.mul(grad_w_up, 0.0)
-                grad_w_down = pl.mul(grad_w_down, 0.0)
-
-                loss_acc = pl.create_tensor([TOK_TILE, 1], dtype=pl.FP32)
                 loss_acc = pl.mul(loss_acc, 0.0)
 
-                tok_blocks = MAX_SEQ_CFG // TOK_TILE
-                for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
-                    for p0_idx in pl.range(tok_blocks):
-                        p0 = p0_idx * TOK_TILE
+            with pl.incore():
+                for rb in pl.range(HIDDEN_BLOCKS):
+                    r0 = rb * K_CHUNK
+                    for cb in pl.range(MLP_OUT_BLOCKS):
+                        c0 = cb * MLP_OUT_CHUNK
+                        cg = pl.slice(
+                            grad_w_gate, [K_CHUNK, MLP_OUT_CHUNK], [r0, c0]
+                        )
+                        grad_w_gate = pl.assemble(
+                            grad_w_gate, pl.mul(cg, 0.0), [r0, c0]
+                        )
+                        cu = pl.slice(
+                            grad_w_up, [K_CHUNK, MLP_OUT_CHUNK], [r0, c0]
+                        )
+                        grad_w_up = pl.assemble(
+                            grad_w_up, pl.mul(cu, 0.0), [r0, c0]
+                        )
+                for rb in pl.range(MLP_OUT_BLOCKS):
+                    r0 = rb * MLP_OUT_CHUNK
+                    for cb in pl.range(Q_OUT_BLOCKS):
+                        c0 = cb * Q_OUT_CHUNK
+                        cd = pl.slice(
+                            grad_w_down, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [r0, c0]
+                        )
+                        grad_w_down = pl.assemble(
+                            grad_w_down, pl.mul(cd, 0.0), [r0, c0]
+                        )
+
+            tok_blocks = MAX_SEQ_CFG // TOK_TILE
+            for b in pl.parallel(0, BATCH_CFG, 1):
+                for p0_idx in pl.range(tok_blocks):
+                    p0 = p0_idx * TOK_TILE
+                    with pl.auto_incore():
 
                         # ===== FORWARD-1: input RMSNorm =====
                         sq_sum = pl.create_tensor([TOK_TILE, 1], dtype=pl.FP32)
@@ -247,24 +267,16 @@ def build_qwen3_32b_training_forward_backward_program(
                         scores = pl.mul(scores, 0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            q_c = pl.cast(
-                                pl.slice(q_proj_tile, [TOK_TILE, K_CHUNK], [0, k0]),
-                                target_type=pl.FP32,
+                            q_c = pl.slice(
+                                q_proj_tile, [TOK_TILE, K_CHUNK], [0, k0]
                             )
-                            k_c = pl.cast(
-                                pl.slice(k_proj_tile, [TOK_TILE, K_CHUNK], [0, k0]),
-                                target_type=pl.FP32,
-                            )
-                            btrans_scratch = pl.assemble(
-                                btrans_scratch, k_c, [0, 0]
-                            )
-                            k_c_t = pl.slice(
-                                btrans_scratch, [TOK_TILE, K_CHUNK], [0, 0]
+                            k_c = pl.slice(
+                                k_proj_tile, [TOK_TILE, K_CHUNK], [0, k0]
                             )
                             scores = pl.add(
                                 scores,
                                 pl.matmul(
-                                    q_c, k_c_t, b_trans=True, out_dtype=pl.FP32
+                                    q_c, k_c, b_trans=True, out_dtype=pl.FP32
                                 ),
                             )
                         scores = pl.mul(scores, ATTN_SCALE)
@@ -435,10 +447,7 @@ def build_qwen3_32b_training_forward_backward_program(
                             out_tile = pl.assemble(out_tile, out_chunk, [0, o0])
                             out = pl.assemble(
                                 out,
-                                pl.reshape(
-                                    pl.cast(out_chunk, target_type=pl.BF16),
-                                    [1, TOK_TILE, Q_OUT_CHUNK],
-                                ),
+                                pl.cast(out_chunk, target_type=pl.BF16),
                                 [b, p0, o0],
                             )
 
@@ -592,13 +601,13 @@ def build_qwen3_32b_training_forward_backward_program(
                             dr_c = pl.slice(
                                 d_resid1, [TOK_TILE, K_CHUNK], [0, k0]
                             )
-                            q_c = pl.cast(
+                            q_bwd = pl.cast(
                                 pl.slice(
                                     q_proj_tile, [TOK_TILE, K_CHUNK], [0, k0]
                                 ),
                                 target_type=pl.FP32,
                             )
-                            k_c = pl.cast(
+                            k_bwd = pl.cast(
                                 pl.slice(
                                     k_proj_tile, [TOK_TILE, K_CHUNK], [0, k0]
                                 ),
@@ -612,43 +621,35 @@ def build_qwen3_32b_training_forward_backward_program(
                             )
                             contrib = pl.row_sum(
                                 pl.mul(
-                                    dr_c, pl.add(pl.add(q_c, k_c), v_bwd)
+                                    dr_c, pl.add(pl.add(q_bwd, k_bwd), v_bwd)
                                 )
                             )
                             bwd_energy = pl.add(bwd_energy, contrib)
                         bwd_energy = pl.add(bwd_energy, pl.row_sum(attn_w))
                         grad_sink = pl.mul(bwd_energy, 0.0)
 
-                # ====== WEIGHT GRADIENT + MUON OPTIMIZER ======
+            # ====== WEIGHT GRADIENT + MUON OPTIMIZER ======
+            # NS loop is outside incore so each step does pl.slice from
+            # muon_buf in memory, generating tile.load(transpose=True)
+            # instead of tile.transpose in Vec (codegen bug workaround).
 
-                # Stage 1: grad_w_down + Muon
-                proxy_mlp = pl.cast(
-                    pl.slice(w_up, [TOK_TILE, MLP_OUT_CHUNK], [0, 0]),
-                    target_type=pl.BF16,
-                )
-                proxy_scratch = pl.assemble(proxy_scratch, proxy_mlp, [0, 0])
-                proxy_mlp_t = pl.slice(
-                    proxy_scratch, [TOK_TILE, MLP_OUT_CHUNK], [0, 0]
-                )
-                for qb in pl.range(Q_OUT_BLOCKS):
-                    q0 = qb * Q_OUT_CHUNK
+            # Stage 1: grad_w_down + Muon
+            for qb in pl.range(Q_OUT_BLOCKS):
+                q0 = qb * Q_OUT_CHUNK
+                with pl.auto_incore():
+                    proxy_mlp = pl.slice(
+                        w_up, [TOK_TILE, MLP_OUT_CHUNK], [0, 0]
+                    )
                     proxy_go = pl.reshape(
-                        pl.cast(
-                            pl.slice(
-                                target_states,
-                                [1, TOK_TILE, Q_OUT_CHUNK],
-                                [0, 0, q0],
-                            ),
-                            target_type=pl.BF16,
+                        pl.slice(
+                            target_states,
+                            [1, TOK_TILE, Q_OUT_CHUNK],
+                            [0, 0, q0],
                         ),
                         [TOK_TILE, Q_OUT_CHUNK],
                     )
-                    proxy_scratch = pl.assemble(proxy_scratch, proxy_go, [0, 0])
-                    proxy_go_t = pl.slice(
-                        proxy_scratch, [TOK_TILE, Q_OUT_CHUNK], [0, 0]
-                    )
                     grad_down_raw = pl.matmul(
-                        proxy_mlp_t, proxy_go_t, a_trans=True, out_dtype=pl.FP32
+                        proxy_mlp, proxy_go, a_trans=True, out_dtype=pl.FP32
                     )
                     mom_down_prev = pl.slice(
                         mom_w_down, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [0, q0]
@@ -657,416 +658,442 @@ def build_qwen3_32b_training_forward_backward_program(
                         pl.mul(mom_down_prev, MUON_BETA),
                         pl.mul(grad_down_raw, MUON_ONE_MINUS_BETA),
                     )
-                    muon_down = mom_down_new
-                    muon_scratch = pl.assemble(
-                        muon_scratch,
-                        pl.cast(muon_down, target_type=pl.BF16),
-                        [0, 0],
+                    mom_w_down = pl.assemble(
+                        mom_w_down, mom_down_new, [0, q0]
                     )
-                    for _ in pl.range(MUON_NS_STEPS):
-                        gram = pl.create_tensor(
-                            [Q_OUT_CHUNK, Q_OUT_CHUNK], dtype=pl.FP32
+                    muon_buf = pl.assemble(muon_buf, mom_down_new, [0, 0])
+                for _ in pl.range(MUON_NS_STEPS):
+                    with pl.auto_incore():
+                        mu_s1 = pl.slice(
+                            muon_buf,
+                            [MLP_OUT_CHUNK, Q_OUT_CHUNK],
+                            [0, 0],
                         )
-                        gram = pl.mul(gram, 0.0)
-                        for tb in pl.range(MLP_OUT_CHUNK // TOK_TILE):
-                            t0 = tb * TOK_TILE
-                            m_blk = pl.slice(
-                                muon_scratch,
-                                [TOK_TILE, Q_OUT_CHUNK],
-                                [t0, 0],
-                            )
-                            m_blk_t = pl.transpose(m_blk, 0, 1)
-                            gram = pl.add(
-                                gram,
-                                pl.matmul(
-                                    m_blk_t,
-                                    m_blk,
-                                    out_dtype=pl.FP32,
-                                ),
-                            )
-                        muon_down = pl.add(
-                            pl.mul(muon_down, 1.5),
+                        gram_s1 = pl.matmul(
+                            mu_s1, mu_s1,
+                            b_trans=True, out_dtype=pl.FP32,
+                        )
+                        mu_s1_2 = pl.slice(
+                            muon_buf,
+                            [MLP_OUT_CHUNK, Q_OUT_CHUNK],
+                            [0, 0],
+                        )
+                        ns_update_s1 = pl.add(
+                            pl.mul(mu_s1_2, 1.5),
                             pl.mul(
-                                pl.matmul(muon_down, gram, out_dtype=pl.FP32),
+                                pl.matmul(
+                                    gram_s1, mu_s1_2, out_dtype=pl.FP32
+                                ),
                                 -0.5,
                             ),
                         )
-                    grad_w_down = pl.assemble(
-                        grad_w_down, pl.mul(muon_down, -MUON_LR), [0, q0]
+                        muon_buf = pl.assemble(
+                            muon_buf, ns_update_s1, [0, 0]
+                        )
+                with pl.auto_incore():
+                    muon_final_s1 = pl.slice(
+                        muon_buf,
+                        [MLP_OUT_CHUNK, Q_OUT_CHUNK],
+                        [0, 0],
                     )
-                    mom_w_down = pl.assemble(mom_w_down, mom_down_new, [0, q0])
+                    grad_w_down = pl.assemble(
+                        grad_w_down,
+                        pl.mul(muon_final_s1, -MUON_LR),
+                        [0, q0],
+                    )
 
-                # Stage 2: grad_wo / grad_wq / grad_wk / grad_wv + Muon
-                proxy_ctx = pl.cast(
-                    pl.slice(wq, [TOK_TILE, K_CHUNK], [0, 0]),
-                    target_type=pl.BF16,
-                )
-                proxy_n = pl.reshape(
-                    pl.cast(
+            # Stage 2: grad_wo / grad_wq / grad_wk / grad_wv + Muon
+            for qb in pl.range(Q_OUT_BLOCKS):
+                q0 = qb * Q_OUT_CHUNK
+
+                # -- wo --
+                with pl.auto_incore():
+                    proxy_ctx = pl.slice(
+                        wq, [TOK_TILE, K_CHUNK], [0, 0]
+                    )
+                    proxy_tgt = pl.reshape(
+                        pl.slice(
+                            target_states,
+                            [1, TOK_TILE, Q_OUT_CHUNK],
+                            [0, 0, q0],
+                        ),
+                        [TOK_TILE, Q_OUT_CHUNK],
+                    )
+                    grad_wo_raw = pl.matmul(
+                        proxy_ctx, proxy_tgt,
+                        a_trans=True, out_dtype=pl.FP32,
+                    )
+                    mom_wo_prev = pl.slice(
+                        mom_wo, [K_CHUNK, Q_OUT_CHUNK], [0, q0]
+                    )
+                    mom_wo_new = pl.add(
+                        pl.mul(mom_wo_prev, MUON_BETA),
+                        pl.mul(grad_wo_raw, MUON_ONE_MINUS_BETA),
+                    )
+                    mom_wo = pl.assemble(mom_wo, mom_wo_new, [0, q0])
+                    muon_buf = pl.assemble(muon_buf, mom_wo_new, [0, 0])
+                for _ in pl.range(MUON_NS_STEPS):
+                    with pl.auto_incore():
+                        mu_wo = pl.slice(
+                            muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
+                        )
+                        gram_wo = pl.matmul(
+                            mu_wo, mu_wo,
+                            b_trans=True, out_dtype=pl.FP32,
+                        )
+                        mu_wo_2 = pl.slice(
+                            muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
+                        )
+                        ns_upd_wo = pl.add(
+                            pl.mul(mu_wo_2, 1.5),
+                            pl.mul(
+                                pl.matmul(
+                                    gram_wo, mu_wo_2, out_dtype=pl.FP32
+                                ),
+                                -0.5,
+                            ),
+                        )
+                        muon_buf = pl.assemble(
+                            muon_buf, ns_upd_wo, [0, 0]
+                        )
+                with pl.auto_incore():
+                    muon_final_wo = pl.slice(
+                        muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
+                    )
+                    grad_wo = pl.assemble(
+                        grad_wo, pl.mul(muon_final_wo, -MUON_LR), [0, q0]
+                    )
+
+                # -- wq --
+                with pl.auto_incore():
+                    proxy_n = pl.reshape(
                         pl.slice(
                             hidden_states,
                             [1, TOK_TILE, K_CHUNK],
                             [0, 0, 0],
                         ),
-                        target_type=pl.BF16,
-                    ),
-                    [TOK_TILE, K_CHUNK],
-                )
-                proxy_scratch = pl.assemble(proxy_scratch, proxy_ctx, [0, 0])
-                proxy_ctx_t = pl.slice(
-                    proxy_scratch, [TOK_TILE, K_CHUNK], [0, 0]
-                )
-                proxy_scratch = pl.assemble(proxy_scratch, proxy_n, [0, 0])
-                proxy_n_t = pl.slice(
-                    proxy_scratch, [TOK_TILE, K_CHUNK], [0, 0]
-                )
-                for qb in pl.range(Q_OUT_BLOCKS):
-                    q0 = qb * Q_OUT_CHUNK
-                    proxy_tgt = pl.reshape(
-                        pl.cast(
-                            pl.slice(
-                                target_states,
-                                [1, TOK_TILE, Q_OUT_CHUNK],
-                                [0, 0, q0],
-                            ),
-                            target_type=pl.BF16,
+                        [TOK_TILE, K_CHUNK],
+                    )
+                    proxy_tgt_q = pl.reshape(
+                        pl.slice(
+                            target_states,
+                            [1, TOK_TILE, Q_OUT_CHUNK],
+                            [0, 0, q0],
                         ),
                         [TOK_TILE, Q_OUT_CHUNK],
                     )
-                    proxy_scratch = pl.assemble(proxy_scratch, proxy_tgt, [0, 0])
-                    proxy_tgt_t = pl.slice(
-                        proxy_scratch, [TOK_TILE, Q_OUT_CHUNK], [0, 0]
-                    )
-
-                    # -- wo --
-                    grad_wo_raw = pl.matmul(
-                        proxy_ctx_t, proxy_tgt_t, a_trans=True, out_dtype=pl.FP32
-                    )
-                    mom_wo_prev = pl.slice(mom_wo, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
-                    mom_wo_new = pl.add(
-                        pl.mul(mom_wo_prev, MUON_BETA),
-                        pl.mul(grad_wo_raw, MUON_ONE_MINUS_BETA),
-                    )
-                    muon_wo = mom_wo_new
-                    muon_scratch = pl.assemble(
-                        muon_scratch,
-                        pl.cast(muon_wo, target_type=pl.BF16),
-                        [0, 0],
-                    )
-                    for _ in pl.range(MUON_NS_STEPS):
-                        gram = pl.create_tensor(
-                            [Q_OUT_CHUNK, Q_OUT_CHUNK], dtype=pl.FP32
-                        )
-                        gram = pl.mul(gram, 0.0)
-                        for tb in pl.range(K_CHUNK // TOK_TILE):
-                            t0 = tb * TOK_TILE
-                            m_blk = pl.slice(
-                                muon_scratch,
-                                [TOK_TILE, Q_OUT_CHUNK],
-                                [t0, 0],
-                            )
-                            m_blk_t = pl.transpose(m_blk, 0, 1)
-                            gram = pl.add(
-                                gram,
-                                pl.matmul(
-                                    m_blk_t,
-                                    m_blk,
-                                    out_dtype=pl.FP32,
-                                ),
-                            )
-                        muon_wo = pl.add(
-                            pl.mul(muon_wo, 1.5),
-                            pl.mul(
-                                pl.matmul(muon_wo, gram, out_dtype=pl.FP32),
-                                -0.5,
-                            ),
-                        )
-                    grad_wo = pl.assemble(
-                        grad_wo, pl.mul(muon_wo, -MUON_LR), [0, q0]
-                    )
-                    mom_wo = pl.assemble(mom_wo, mom_wo_new, [0, q0])
-
-                    # -- wq --
                     grad_wq_raw = pl.matmul(
-                        proxy_n_t, proxy_tgt_t, a_trans=True, out_dtype=pl.FP32
+                        proxy_n, proxy_tgt_q,
+                        a_trans=True, out_dtype=pl.FP32,
                     )
-                    mom_wq_prev = pl.slice(mom_wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
+                    mom_wq_prev = pl.slice(
+                        mom_wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0]
+                    )
                     mom_wq_new = pl.add(
                         pl.mul(mom_wq_prev, MUON_BETA),
                         pl.mul(grad_wq_raw, MUON_ONE_MINUS_BETA),
                     )
-                    muon_wq = mom_wq_new
-                    muon_scratch = pl.assemble(
-                        muon_scratch,
-                        pl.cast(muon_wq, target_type=pl.BF16),
-                        [0, 0],
-                    )
-                    for _ in pl.range(MUON_NS_STEPS):
-                        gram = pl.create_tensor(
-                            [Q_OUT_CHUNK, Q_OUT_CHUNK], dtype=pl.FP32
+                    mom_wq = pl.assemble(mom_wq, mom_wq_new, [0, q0])
+                    muon_buf = pl.assemble(muon_buf, mom_wq_new, [0, 0])
+                for _ in pl.range(MUON_NS_STEPS):
+                    with pl.auto_incore():
+                        mu_wq = pl.slice(
+                            muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
                         )
-                        gram = pl.mul(gram, 0.0)
-                        for tb in pl.range(K_CHUNK // TOK_TILE):
-                            t0 = tb * TOK_TILE
-                            m_blk = pl.slice(
-                                muon_scratch,
-                                [TOK_TILE, Q_OUT_CHUNK],
-                                [t0, 0],
-                            )
-                            m_blk_t = pl.transpose(m_blk, 0, 1)
-                            gram = pl.add(
-                                gram,
-                                pl.matmul(
-                                    m_blk_t,
-                                    m_blk,
-                                    out_dtype=pl.FP32,
-                                ),
-                            )
-                        muon_wq = pl.add(
-                            pl.mul(muon_wq, 1.5),
+                        gram_wq = pl.matmul(
+                            mu_wq, mu_wq,
+                            b_trans=True, out_dtype=pl.FP32,
+                        )
+                        mu_wq_2 = pl.slice(
+                            muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
+                        )
+                        ns_upd_wq = pl.add(
+                            pl.mul(mu_wq_2, 1.5),
                             pl.mul(
-                                pl.matmul(muon_wq, gram, out_dtype=pl.FP32),
+                                pl.matmul(
+                                    gram_wq, mu_wq_2, out_dtype=pl.FP32
+                                ),
                                 -0.5,
                             ),
                         )
+                        muon_buf = pl.assemble(
+                            muon_buf, ns_upd_wq, [0, 0]
+                        )
+                with pl.auto_incore():
+                    muon_final_wq = pl.slice(
+                        muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
+                    )
                     grad_wq = pl.assemble(
-                        grad_wq, pl.mul(muon_wq, -MUON_LR), [0, q0]
+                        grad_wq, pl.mul(muon_final_wq, -MUON_LR), [0, q0]
                     )
-                    mom_wq = pl.assemble(mom_wq, mom_wq_new, [0, q0])
 
-                    # -- wk --
-                    grad_wk_raw = pl.matmul(
-                        proxy_n_t, proxy_tgt_t, a_trans=True, out_dtype=pl.FP32
+                # -- wk --
+                with pl.auto_incore():
+                    proxy_n_k = pl.reshape(
+                        pl.slice(
+                            hidden_states,
+                            [1, TOK_TILE, K_CHUNK],
+                            [0, 0, 0],
+                        ),
+                        [TOK_TILE, K_CHUNK],
                     )
-                    mom_wk_prev = pl.slice(mom_wk, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
+                    proxy_tgt_k = pl.reshape(
+                        pl.slice(
+                            target_states,
+                            [1, TOK_TILE, Q_OUT_CHUNK],
+                            [0, 0, q0],
+                        ),
+                        [TOK_TILE, Q_OUT_CHUNK],
+                    )
+                    grad_wk_raw = pl.matmul(
+                        proxy_n_k, proxy_tgt_k,
+                        a_trans=True, out_dtype=pl.FP32,
+                    )
+                    mom_wk_prev = pl.slice(
+                        mom_wk, [K_CHUNK, Q_OUT_CHUNK], [0, q0]
+                    )
                     mom_wk_new = pl.add(
                         pl.mul(mom_wk_prev, MUON_BETA),
                         pl.mul(grad_wk_raw, MUON_ONE_MINUS_BETA),
                     )
-                    muon_wk = mom_wk_new
-                    muon_scratch = pl.assemble(
-                        muon_scratch,
-                        pl.cast(muon_wk, target_type=pl.BF16),
-                        [0, 0],
-                    )
-                    for _ in pl.range(MUON_NS_STEPS):
-                        gram = pl.create_tensor(
-                            [Q_OUT_CHUNK, Q_OUT_CHUNK], dtype=pl.FP32
+                    mom_wk = pl.assemble(mom_wk, mom_wk_new, [0, q0])
+                    muon_buf = pl.assemble(muon_buf, mom_wk_new, [0, 0])
+                for _ in pl.range(MUON_NS_STEPS):
+                    with pl.auto_incore():
+                        mu_wk = pl.slice(
+                            muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
                         )
-                        gram = pl.mul(gram, 0.0)
-                        for tb in pl.range(K_CHUNK // TOK_TILE):
-                            t0 = tb * TOK_TILE
-                            m_blk = pl.slice(
-                                muon_scratch,
-                                [TOK_TILE, Q_OUT_CHUNK],
-                                [t0, 0],
-                            )
-                            m_blk_t = pl.transpose(m_blk, 0, 1)
-                            gram = pl.add(
-                                gram,
-                                pl.matmul(
-                                    m_blk_t,
-                                    m_blk,
-                                    out_dtype=pl.FP32,
-                                ),
-                            )
-                        muon_wk = pl.add(
-                            pl.mul(muon_wk, 1.5),
+                        gram_wk = pl.matmul(
+                            mu_wk, mu_wk,
+                            b_trans=True, out_dtype=pl.FP32,
+                        )
+                        mu_wk_2 = pl.slice(
+                            muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
+                        )
+                        ns_upd_wk = pl.add(
+                            pl.mul(mu_wk_2, 1.5),
                             pl.mul(
-                                pl.matmul(muon_wk, gram, out_dtype=pl.FP32),
+                                pl.matmul(
+                                    gram_wk, mu_wk_2, out_dtype=pl.FP32
+                                ),
                                 -0.5,
                             ),
                         )
+                        muon_buf = pl.assemble(
+                            muon_buf, ns_upd_wk, [0, 0]
+                        )
+                with pl.auto_incore():
+                    muon_final_wk = pl.slice(
+                        muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
+                    )
                     grad_wk = pl.assemble(
-                        grad_wk, pl.mul(muon_wk, -MUON_LR), [0, q0]
+                        grad_wk, pl.mul(muon_final_wk, -MUON_LR), [0, q0]
                     )
-                    mom_wk = pl.assemble(mom_wk, mom_wk_new, [0, q0])
 
-                    # -- wv --
-                    grad_wv_raw = pl.matmul(
-                        proxy_n_t, proxy_tgt_t, a_trans=True, out_dtype=pl.FP32
+                # -- wv --
+                with pl.auto_incore():
+                    proxy_n_v = pl.reshape(
+                        pl.slice(
+                            hidden_states,
+                            [1, TOK_TILE, K_CHUNK],
+                            [0, 0, 0],
+                        ),
+                        [TOK_TILE, K_CHUNK],
                     )
-                    mom_wv_prev = pl.slice(mom_wv, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
+                    proxy_tgt_v = pl.reshape(
+                        pl.slice(
+                            target_states,
+                            [1, TOK_TILE, Q_OUT_CHUNK],
+                            [0, 0, q0],
+                        ),
+                        [TOK_TILE, Q_OUT_CHUNK],
+                    )
+                    grad_wv_raw = pl.matmul(
+                        proxy_n_v, proxy_tgt_v,
+                        a_trans=True, out_dtype=pl.FP32,
+                    )
+                    mom_wv_prev = pl.slice(
+                        mom_wv, [K_CHUNK, Q_OUT_CHUNK], [0, q0]
+                    )
                     mom_wv_new = pl.add(
                         pl.mul(mom_wv_prev, MUON_BETA),
                         pl.mul(grad_wv_raw, MUON_ONE_MINUS_BETA),
                     )
-                    muon_wv = mom_wv_new
-                    muon_scratch = pl.assemble(
-                        muon_scratch,
-                        pl.cast(muon_wv, target_type=pl.BF16),
-                        [0, 0],
-                    )
-                    for _ in pl.range(MUON_NS_STEPS):
-                        gram = pl.create_tensor(
-                            [Q_OUT_CHUNK, Q_OUT_CHUNK], dtype=pl.FP32
+                    mom_wv = pl.assemble(mom_wv, mom_wv_new, [0, q0])
+                    muon_buf = pl.assemble(muon_buf, mom_wv_new, [0, 0])
+                for _ in pl.range(MUON_NS_STEPS):
+                    with pl.auto_incore():
+                        mu_wv = pl.slice(
+                            muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
                         )
-                        gram = pl.mul(gram, 0.0)
-                        for tb in pl.range(K_CHUNK // TOK_TILE):
-                            t0 = tb * TOK_TILE
-                            m_blk = pl.slice(
-                                muon_scratch,
-                                [TOK_TILE, Q_OUT_CHUNK],
-                                [t0, 0],
-                            )
-                            m_blk_t = pl.transpose(m_blk, 0, 1)
-                            gram = pl.add(
-                                gram,
-                                pl.matmul(
-                                    m_blk_t,
-                                    m_blk,
-                                    out_dtype=pl.FP32,
-                                ),
-                            )
-                        muon_wv = pl.add(
-                            pl.mul(muon_wv, 1.5),
+                        gram_wv = pl.matmul(
+                            mu_wv, mu_wv,
+                            b_trans=True, out_dtype=pl.FP32,
+                        )
+                        mu_wv_2 = pl.slice(
+                            muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
+                        )
+                        ns_upd_wv = pl.add(
+                            pl.mul(mu_wv_2, 1.5),
                             pl.mul(
-                                pl.matmul(muon_wv, gram, out_dtype=pl.FP32),
+                                pl.matmul(
+                                    gram_wv, mu_wv_2, out_dtype=pl.FP32
+                                ),
                                 -0.5,
                             ),
                         )
-                    grad_wv = pl.assemble(
-                        grad_wv, pl.mul(muon_wv, -MUON_LR), [0, q0]
+                        muon_buf = pl.assemble(
+                            muon_buf, ns_upd_wv, [0, 0]
+                        )
+                with pl.auto_incore():
+                    muon_final_wv = pl.slice(
+                        muon_buf, [K_CHUNK, Q_OUT_CHUNK], [0, 0]
                     )
-                    mom_wv = pl.assemble(mom_wv, mom_wv_new, [0, q0])
+                    grad_wv = pl.assemble(
+                        grad_wv, pl.mul(muon_final_wv, -MUON_LR), [0, q0]
+                    )
 
-                # Stage 3: grad_w_gate / grad_w_up + Muon
-                proxy_post = pl.reshape(
-                    pl.cast(
+            # Stage 3: grad_w_gate / grad_w_up + Muon
+            for mb in pl.range(MLP_OUT_BLOCKS):
+                m0 = mb * MLP_OUT_CHUNK
+
+                # -- w_gate --
+                with pl.auto_incore():
+                    proxy_post_g = pl.reshape(
                         pl.slice(
                             hidden_states,
                             [1, TOK_TILE, K_CHUNK],
                             [0, 0, K_CHUNK],
                         ),
-                        target_type=pl.BF16,
-                    ),
-                    [TOK_TILE, K_CHUNK],
-                )
-                proxy_scratch = pl.assemble(proxy_scratch, proxy_post, [0, 0])
-                proxy_post_t = pl.slice(
-                    proxy_scratch, [TOK_TILE, K_CHUNK], [0, 0]
-                )
-                for mb in pl.range(MLP_OUT_BLOCKS):
-                    m0 = mb * MLP_OUT_CHUNK
-                    proxy_gg = pl.cast(
-                        pl.slice(w_gate, [TOK_TILE, MLP_OUT_CHUNK], [0, m0]),
-                        target_type=pl.BF16,
+                        [TOK_TILE, K_CHUNK],
                     )
-                    proxy_gu = pl.cast(
-                        pl.slice(w_up, [TOK_TILE, MLP_OUT_CHUNK], [0, m0]),
-                        target_type=pl.BF16,
-                    )
-                    proxy_scratch = pl.assemble(proxy_scratch, proxy_gg, [0, 0])
-                    proxy_gg_t = pl.slice(
-                        proxy_scratch, [TOK_TILE, MLP_OUT_CHUNK], [0, 0]
-                    )
-                    proxy_scratch = pl.assemble(proxy_scratch, proxy_gu, [0, 0])
-                    proxy_gu_t = pl.slice(
-                        proxy_scratch, [TOK_TILE, MLP_OUT_CHUNK], [0, 0]
+                    proxy_gg = pl.slice(
+                        w_gate, [TOK_TILE, MLP_OUT_CHUNK], [0, m0]
                     )
                     grad_wg_raw = pl.matmul(
-                        proxy_post_t, proxy_gg_t, a_trans=True, out_dtype=pl.FP32
+                        proxy_post_g, proxy_gg,
+                        a_trans=True, out_dtype=pl.FP32,
                     )
-                    grad_wu_raw = pl.matmul(
-                        proxy_post_t, proxy_gu_t, a_trans=True, out_dtype=pl.FP32
-                    )
-
                     mom_wg_prev = pl.slice(
                         mom_w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, m0]
-                    )
-                    mom_wu_prev = pl.slice(
-                        mom_w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, m0]
                     )
                     mom_wg_new = pl.add(
                         pl.mul(mom_wg_prev, MUON_BETA),
                         pl.mul(grad_wg_raw, MUON_ONE_MINUS_BETA),
                     )
+                    mom_w_gate = pl.assemble(
+                        mom_w_gate, mom_wg_new, [0, m0]
+                    )
+                    muon_buf = pl.assemble(muon_buf, mom_wg_new, [0, 0])
+                for _ in pl.range(MUON_NS_STEPS):
+                    with pl.auto_incore():
+                        mu_wg = pl.slice(
+                            muon_buf,
+                            [K_CHUNK, MLP_OUT_CHUNK],
+                            [0, 0],
+                        )
+                        gram_wg = pl.matmul(
+                            mu_wg, mu_wg,
+                            b_trans=True, out_dtype=pl.FP32,
+                        )
+                        mu_wg_2 = pl.slice(
+                            muon_buf,
+                            [K_CHUNK, MLP_OUT_CHUNK],
+                            [0, 0],
+                        )
+                        ns_upd_wg = pl.add(
+                            pl.mul(mu_wg_2, 1.5),
+                            pl.mul(
+                                pl.matmul(
+                                    gram_wg, mu_wg_2, out_dtype=pl.FP32
+                                ),
+                                -0.5,
+                            ),
+                        )
+                        muon_buf = pl.assemble(
+                            muon_buf, ns_upd_wg, [0, 0]
+                        )
+                with pl.auto_incore():
+                    muon_final_wg = pl.slice(
+                        muon_buf,
+                        [K_CHUNK, MLP_OUT_CHUNK],
+                        [0, 0],
+                    )
+                    grad_w_gate = pl.assemble(
+                        grad_w_gate,
+                        pl.mul(muon_final_wg, -MUON_LR),
+                        [0, m0],
+                    )
+
+                # -- w_up --
+                with pl.auto_incore():
+                    proxy_post_u = pl.reshape(
+                        pl.slice(
+                            hidden_states,
+                            [1, TOK_TILE, K_CHUNK],
+                            [0, 0, K_CHUNK],
+                        ),
+                        [TOK_TILE, K_CHUNK],
+                    )
+                    proxy_gu = pl.slice(
+                        w_up, [TOK_TILE, MLP_OUT_CHUNK], [0, m0]
+                    )
+                    grad_wu_raw = pl.matmul(
+                        proxy_post_u, proxy_gu,
+                        a_trans=True, out_dtype=pl.FP32,
+                    )
+                    mom_wu_prev = pl.slice(
+                        mom_w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, m0]
+                    )
                     mom_wu_new = pl.add(
                         pl.mul(mom_wu_prev, MUON_BETA),
                         pl.mul(grad_wu_raw, MUON_ONE_MINUS_BETA),
                     )
-
-                    muon_wg = mom_wg_new
-                    muon_scratch = pl.assemble(
-                        muon_scratch,
-                        pl.cast(muon_wg, target_type=pl.BF16),
-                        [0, 0],
-                    )
-                    for _ in pl.range(MUON_NS_STEPS):
-                        ns_acc_g = pl.create_tensor(
-                            [K_CHUNK, MLP_OUT_CHUNK], dtype=pl.FP32
+                    mom_w_up = pl.assemble(mom_w_up, mom_wu_new, [0, m0])
+                    muon_buf = pl.assemble(muon_buf, mom_wu_new, [0, 0])
+                for _ in pl.range(MUON_NS_STEPS):
+                    with pl.auto_incore():
+                        mu_wu = pl.slice(
+                            muon_buf,
+                            [K_CHUNK, MLP_OUT_CHUNK],
+                            [0, 0],
                         )
-                        ns_acc_g = pl.mul(ns_acc_g, 0.0)
-                        muon_wg_bf = pl.cast(muon_wg, target_type=pl.BF16)
-                        for tb in pl.range(K_CHUNK // TOK_TILE):
-                            t0 = tb * TOK_TILE
-                            m_blk_g = pl.slice(
-                                muon_scratch,
-                                [TOK_TILE, MLP_OUT_CHUNK],
-                                [t0, 0],
-                            )
-                            m_blk_gt = pl.transpose(m_blk_g, 0, 1)
-                            tmp_g = pl.matmul(
-                                muon_wg_bf, m_blk_gt, out_dtype=pl.FP32
-                            )
-                            tmp_g_bf = pl.cast(tmp_g, target_type=pl.BF16)
-                            ns_acc_g = pl.add(
-                                ns_acc_g,
+                        gram_wu = pl.matmul(
+                            mu_wu, mu_wu,
+                            b_trans=True, out_dtype=pl.FP32,
+                        )
+                        mu_wu_2 = pl.slice(
+                            muon_buf,
+                            [K_CHUNK, MLP_OUT_CHUNK],
+                            [0, 0],
+                        )
+                        ns_upd_wu = pl.add(
+                            pl.mul(mu_wu_2, 1.5),
+                            pl.mul(
                                 pl.matmul(
-                                    tmp_g_bf, m_blk_g, out_dtype=pl.FP32
+                                    gram_wu, mu_wu_2, out_dtype=pl.FP32
                                 ),
-                            )
-                        muon_wg = pl.add(
-                            pl.mul(muon_wg, 1.5),
-                            pl.mul(ns_acc_g, -0.5),
+                                -0.5,
+                            ),
                         )
-
-                    muon_wu = mom_wu_new
-                    muon_scratch = pl.assemble(
-                        muon_scratch,
-                        pl.cast(muon_wu, target_type=pl.BF16),
+                        muon_buf = pl.assemble(
+                            muon_buf, ns_upd_wu, [0, 0]
+                        )
+                with pl.auto_incore():
+                    muon_final_wu = pl.slice(
+                        muon_buf,
+                        [K_CHUNK, MLP_OUT_CHUNK],
                         [0, 0],
-                    )
-                    for _ in pl.range(MUON_NS_STEPS):
-                        ns_acc_u = pl.create_tensor(
-                            [K_CHUNK, MLP_OUT_CHUNK], dtype=pl.FP32
-                        )
-                        ns_acc_u = pl.mul(ns_acc_u, 0.0)
-                        muon_wu_bf = pl.cast(muon_wu, target_type=pl.BF16)
-                        for tb in pl.range(K_CHUNK // TOK_TILE):
-                            t0 = tb * TOK_TILE
-                            m_blk_u = pl.slice(
-                                muon_scratch,
-                                [TOK_TILE, MLP_OUT_CHUNK],
-                                [t0, 0],
-                            )
-                            m_blk_ut = pl.transpose(m_blk_u, 0, 1)
-                            tmp_u = pl.matmul(
-                                muon_wu_bf, m_blk_ut, out_dtype=pl.FP32
-                            )
-                            tmp_u_bf = pl.cast(tmp_u, target_type=pl.BF16)
-                            ns_acc_u = pl.add(
-                                ns_acc_u,
-                                pl.matmul(
-                                    tmp_u_bf, m_blk_u, out_dtype=pl.FP32
-                                ),
-                            )
-                        muon_wu = pl.add(
-                            pl.mul(muon_wu, 1.5),
-                            pl.mul(ns_acc_u, -0.5),
-                        )
-
-                    grad_w_gate = pl.assemble(
-                        grad_w_gate, pl.mul(muon_wg, -MUON_LR), [0, m0]
                     )
                     grad_w_up = pl.assemble(
-                        grad_w_up, pl.mul(muon_wu, -MUON_LR), [0, m0]
+                        grad_w_up,
+                        pl.mul(muon_final_wu, -MUON_LR),
+                        [0, m0],
                     )
-                    mom_w_gate = pl.assemble(mom_w_gate, mom_wg_new, [0, m0])
-                    mom_w_up = pl.assemble(mom_w_up, mom_wu_new, [0, m0])
 
-                loss_vec = pl.slice(loss_acc, [1], [0, 0])
-                loss_out = pl.assemble(loss_out, loss_vec, [0])
+            with pl.incore():
+                loss_val = pl.slice(loss_acc, [TOK_TILE, 1], [0, 0])
+                loss_out = pl.assemble(loss_out, loss_val, [0, 0])
 
             return (
                 grad_wq,
@@ -1203,7 +1230,7 @@ def build_tensor_specs(
             "grad_w_down", [intermediate_size, hidden_size], torch.float32, is_output=True
         ),
         TensorSpec("out", [batch, max_seq_len, hidden_size], torch.bfloat16, is_output=True),
-        TensorSpec("loss_out", [1], torch.float32, is_output=True),
+        TensorSpec("loss_out", [TOK_TILE, 1], torch.float32, is_output=True),
     ]
 
 

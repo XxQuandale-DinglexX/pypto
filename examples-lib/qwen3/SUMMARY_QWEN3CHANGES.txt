@@ -146,49 +146,101 @@ File mapping:
 ================================================================================
 
 8.1  Constants (scaled down for testing)
-  - BATCH: 64 → 1.
-  - MAX_SEQ: 4096 → 4.
-  - HIDDEN: 5120 → 80.
-  - INTERMEDIATE: 25600 → 400.
-  - K_CHUNK: 64 → 4.
-  - Q_OUT_CHUNK: 128 → 8.
-  - MLP_OUT_CHUNK: 256 → 16.
+  - BATCH: 64 → 1  (64//64).
+  - MAX_SEQ: 4096 → 4  (4096//1024).
+  - HIDDEN: 5120 → 80  (5120//64).
+  - INTERMEDIATE: 25600 → 400  (25600//64).
+  - K_CHUNK: 64 → 4  (64//16).
+  - Q_OUT_CHUNK: 128 → 8  (128//16).
+  - MLP_OUT_CHUNK: 256 → 16  (256//16).
 
-8.2  Scratch buffers
-  - New: muon_scratch [MLP_OUT_CHUNK, MLP_OUT_CHUNK] BF16.
-  - New: proxy_scratch [TOK_TILE, MLP_OUT_CHUNK] BF16.
-  - New: btrans_scratch [TOK_TILE, K_CHUNK] FP32.
-  (Used for staging data for matmul transpose patterns.)
+8.2  Top-level tensor allocation
+  - loss_acc [TOK_TILE, 1] FP32 created outside all incore scopes (was
+    previously inside the single auto_incore).
+  - muon_buf [MLP_OUT_CHUNK, MLP_OUT_CHUNK] FP32 created at top level as
+    staging buffer for Newton-Schulz iterations (written by assemble,
+    read back by slice in separate incore scopes to force memory
+    round-trip).
+  - Old scratch buffers (muon_scratch, proxy_scratch, btrans_scratch) removed.
 
-8.3  Forward pass
-  - Input RMSNorm: reshape-after-slice pattern for 3D tensors.
-  - Attention scores: k_c staged via btrans_scratch (assemble/slice) before
-    matmul with b_trans=True.
-  - Attention context: explicit ctx_acc zeroed + add(ctx_acc, matmul(...))
-    instead of direct fused matmul.
+8.3  Incore scope structure (major restructuring)
+  Original: one monolithic pl.auto_incore() around the entire function body.
+  New: split into many separate incore scopes to stay within Vec buffer
+  limit (253952 bytes):
+    (a) Gradient zeroing: two pl.incore() blocks — one for small grad
+        tensors (wq/wk/wv/wo), one for large grads (w_gate/w_up/w_down)
+        with chunked MLP_OUT_BLOCKS loop.
+    (b) Forward + backward: per-token pl.auto_incore() inside the batch/
+        position loop body.
+    (c) Weight gradient stages: per-block pl.auto_incore() (see 8.7).
+    (d) Loss extraction: separate pl.incore() at the end.
+
+8.4  Forward pass
+  - 3D→2D slicing: pl.reshape(pl.slice(tensor, [1, TOK, CHUNK], ...),
+    [TOK, CHUNK]) pattern used for hidden_states and target_states.
+  - Attention scores: k_c loaded directly from k_proj_tile and used with
+    b_trans=True in matmul (no staging buffer needed).
+  - Attention context: explicit ctx_acc zeroed via pl.mul(ctx_acc, 0.0)
+    then accumulated via pl.add(ctx_acc, matmul(...)).
   - O projection residual: reshape-after-slice for hidden_states.
 
-8.4  Loss accumulation
+8.5  Loss accumulation
   - Old: per-token loop with tensor.read and [1,1] scalar tensors.
   - New: vector add with [TOK_TILE, 1] accumulator (loss_prev + sq_row).
+  - loss_out changed from [1] to [TOK_TILE, 1] to match loss_acc directly,
+    avoiding layout mismatch (nd vs dn) during tile.store.
 
-8.5  Backward pass
+8.6  Backward pass
   - MLP backward: d_mlp cast to BF16 before matmul with w_down chunk.
   - Gate/up gradients: d_gate_bf16 / d_up_bf16 intermediate BF16 casts,
     sequential add pattern instead of fused add(add(matmul, matmul)).
-  - Attention backward: v_c renamed to v_bwd.
+  - Attention backward: q_c/k_c renamed to q_bwd/k_bwd to avoid type
+    reassignment with forward-pass variables of different shapes.
 
-8.6  Weight gradients + Muon optimizer (major rewrite)
-  - proxy_scratch used to stage proxy tensors for a_trans matmul patterns.
-  - Stage 1 (w_down): tiled gram matrix computation via muon_scratch
-    (MLP_OUT_CHUNK//TOK_TILE iterations, slice/transpose/matmul per tile).
-  - Stage 2 (wo/wq/wk/wv): proxy_ctx and proxy_n staged via proxy_scratch;
-    tiled gram with K_CHUNK//TOK_TILE iterations.
-  - Stage 3 (w_gate/w_up): different NS formulation — builds ns_acc via
-    matmul(muon_bf, transpose(tile)) then matmul(tmp_bf, tile) instead of
-    computing gram then muon @ gram.
+8.7  Weight gradients + Muon optimizer (major rewrite)
+  Three stages, each processing one weight block per iteration with
+  the outer loop OUTSIDE the incore scope:
 
-8.7  Backend
+  Stage 1 (grad_w_down): for each Q_OUT block:
+    - One auto_incore: compute proxy gradient (a_trans=True matmul of
+      proxy_mlp × proxy_go), momentum update, assemble into muon_buf.
+    - Newton-Schulz loop (MUON_NS_STEPS iterations, each in its own
+      auto_incore): slice muon iterate from muon_buf in memory, compute
+      Gram matrix G'=X@X^T via b_trans=True, update X←1.5X−0.5·G'@X,
+      assemble result back to muon_buf.
+    - One auto_incore: extract final iterate, apply learning rate, assemble
+      into grad_w_down.
+
+  Stage 2 (grad_wo/wq/wk/wv): same pattern per Q_OUT block, with each
+    weight (wo, wq, wk, wv) having its own gradient+momentum+NS sequence.
+
+  Stage 3 (grad_w_gate/w_up): same pattern per MLP_OUT block.
+
+  Key design decisions for the Muon Newton-Schulz implementation:
+    (a) Gram matrix reformulated: uses b_trans=True (G'=X@X^T) instead of
+        a_trans=True (G=X^T@X). Update becomes G'@X instead of X@G.
+        Mathematically equivalent by associativity: X@(X^T@X) = (X@X^T)@X.
+    (b) The b_trans=True formulation generates tile.load(transpose=True)
+        from memory to Mem.Mat, instead of tile.transpose in Mem.Vec which
+        triggers a codegen bug (matmul K-dimension mismatch) during PTO
+        code generation for non-square operands.
+    (c) NS loop placed outside auto_incore so each step's matmul operands
+        come from pl.slice of muon_buf (a tensor in memory), not from
+        computed Vec tiles. This forces the converter to use transposed
+        memory loads rather than Vec transposes.
+    (d) muon_buf serves as the staging tensor — written via pl.assemble at
+        end of each NS step, read back via pl.slice at start of next step.
+        The loop boundary prevents the optimizer from eliminating the
+        memory round-trip.
+
+8.8  Variable naming
+  - Unique variable names per stage to avoid PyPTO type reassignment errors:
+    mu_s1/gram_s1/ns_update_s1 (stage 1), mu_wo/gram_wo/ns_upd_wo (stage 2
+    wo), mu_wq/gram_wq/ns_upd_wq (stage 2 wq), etc.
+  - proxy_tgt_q/proxy_tgt_k/proxy_tgt_v, proxy_n_k/proxy_n_v,
+    proxy_post_g/proxy_post_u to avoid reusing names across different shapes.
+
+8.9  Backend
   - BackendType.CCE → BackendType.Ascend950.
   - save_kernels / save_kernels_dir added to RunConfig.
 
@@ -206,8 +258,9 @@ prefill_tilelet → _new     | RoPE: concat → create_tensor+assemble
 decode → _new              | Same as qwen3-32b (grouped Q, staged incore, etc.)
 decode_scope2 → _new       | Accumulator init: full → create_tensor+mul
 decode_tilelet → _new      | Accumulator init: full → create_tensor+mul
-training_fwd_bwd → _new    | Scaled constants, scratch buffers, reshape-after-
-                           | slice, tiled Muon NS, vector loss, Ascend950
+training_fwd_bwd → _new    | Scaled constants, multi-scope incore, reshape-after-
+                           | slice, Muon NS with muon_buf staging & b_trans Gram,
+                           | vector loss, unique variable names, Ascend950
 ---------------------------+-----------------------------------------------------
 All files                  | CCE→Ascend950, save_kernels, early return on
                            | code_runner error, pl.full removed
