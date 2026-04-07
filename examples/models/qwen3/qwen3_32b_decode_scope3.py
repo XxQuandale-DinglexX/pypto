@@ -206,21 +206,35 @@ def build_tensor_specs(
         fan_in = shape[1]
         return torch.randn(shape, dtype=torch.float32) / (fan_in ** 0.5)
 
+    def init_attn_out():
+        return xavier_bf16([batch, hidden_size])
+
+    def init_hidden_states():
+        return xavier_bf16([batch, hidden_size])
+
+    def init_wo():
+        return xavier_bf16([hidden_size, hidden_size])
+
+    def init_post_rms_weight():
+        return xavier_fp32([1, hidden_size])
+
+    def init_w_gate():
+        return xavier_bf16([hidden_size, intermediate_size])
+
+    def init_w_up():
+        return xavier_bf16([hidden_size, intermediate_size])
+
+    def init_w_down():
+        return xavier_bf16([intermediate_size, hidden_size])
+
     return [
-        TensorSpec("attn_out", [batch, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([batch, hidden_size])),
-        TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([batch, hidden_size])),
-        TensorSpec("wo", [hidden_size, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([hidden_size, hidden_size])),
-        TensorSpec("post_rms_weight", [1, hidden_size], torch.float32,
-                   init_value=xavier_fp32([1, hidden_size])),
-        TensorSpec("w_gate", [hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=xavier_bf16([hidden_size, intermediate_size])),
-        TensorSpec("w_up", [hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=xavier_bf16([hidden_size, intermediate_size])),
-        TensorSpec("w_down", [intermediate_size, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([intermediate_size, hidden_size])),
+        TensorSpec("attn_out", [batch, hidden_size], torch.bfloat16, init_value=init_attn_out),
+        TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16, init_value=init_hidden_states),
+        TensorSpec("wo", [hidden_size, hidden_size], torch.bfloat16, init_value=init_wo),
+        TensorSpec("post_rms_weight", [1, hidden_size], torch.float32, init_value=init_post_rms_weight),
+        TensorSpec("w_gate", [hidden_size, intermediate_size], torch.bfloat16, init_value=init_w_gate),
+        TensorSpec("w_up", [hidden_size, intermediate_size], torch.bfloat16, init_value=init_w_up),
+        TensorSpec("w_down", [intermediate_size, hidden_size], torch.bfloat16, init_value=init_w_down),
         TensorSpec("out", [batch, hidden_size], torch.bfloat16, is_output=True),
     ]
 
@@ -265,11 +279,15 @@ def compile_and_run(
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
-        print("Result: COMPILE OK — device run skipped (code_runner not found).")
-    if not result.passed and result.error:
+        print("Result: COMPILE OK — device run skipped (set SIMPLER_ROOT or install Simpler for on-device execution).")
+    elif not result.passed and result.error:
         print(f"Result: {result.error}")
     return result
 
 
 if __name__ == "__main__":
-    compile_and_run()
+    result = compile_and_run()
+    if not result.passed:
+        if result.error and "code_runner" in result.error:
+            raise SystemExit(0)
+        raise SystemExit(1)

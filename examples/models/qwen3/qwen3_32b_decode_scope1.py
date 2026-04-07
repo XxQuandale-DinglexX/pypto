@@ -291,6 +291,8 @@ def compile_and_run(
             enable_profiling=enable_profiling,
         ),
     )
+    if not result.passed and result.error and "code_runner" in result.error:
+        print("Result: COMPILE OK — device run skipped (set SIMPLER_ROOT or install Simpler for on-device execution).")
     return result
 
 
@@ -310,6 +312,9 @@ if __name__ == "__main__":
         enable_profiling=args.enable_profiling,
     )
     if not result.passed:
+        if result.error and "code_runner" in result.error:
+            # Compilation succeeded; only the Simpler runtime is missing.
+            raise SystemExit(0)
         if result.error:
             print(f"Result: {result.error}")
         raise SystemExit(1)
