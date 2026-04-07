@@ -17,7 +17,9 @@ the program only processes valid tokens per session.
 
 Design goals:
 - keep a decode-like structure and reuse the same primitive ops
-- fuse work in three large auto_incore scopes per token-tile
+- orchestration-only (no auto_incore): large UP_DOWN fused regions hit
+  pto.initialize_l2l_pipe / pto.import_reserved_buffer peer pairing errors on
+  Ascend950; projection and outer batch loops use pl.range instead of pl.parallel
 - all pl.slice / pl.slice of GM tensors use 512-B-aligned shapes
   (full TOK_TILE rows even on the tail tile; padding rows are harmless)
 - scope 2 (attention + KV cache write) iterates only over valid tokens
@@ -117,7 +119,7 @@ def build_qwen3_single_layer_prefill_program(
             w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.BF16],
             out: pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16]:
-            for b in pl.parallel(0, BATCH_CFG, 1):
+            for b in pl.range(BATCH_CFG):
                 seq_len_b = pl.tensor.read(seq_lens, [b])
                 tok_blocks = (seq_len_b + TOK_TILE - 1) // TOK_TILE
                 flat_hidden = pl.reshape(
@@ -131,8 +133,41 @@ def build_qwen3_single_layer_prefill_program(
                     # Uses full [TOK_TILE, ...] views from hidden_states even on the
                     # tail tile — padding rows map to allocated-but-unused MAX_SEQ
                     # slots, keeping every GM view >= 512 B aligned.
-                    with pl.auto_incore(split=pl.SplitMode.UP_DOWN):
-                        sq_acc = pl.full([TOK_TILE, 1], dtype=pl.FP32, value=0.0)
+                    sq_acc = pl.full([TOK_TILE, 1], dtype=pl.FP32, value=0.0)
+                    for kb in pl.range(HIDDEN_BLOCKS):
+                        k0 = kb * K_CHUNK
+                        x_chunk = pl.reshape(
+                            pl.cast(
+                                pl.slice(
+                                    flat_hidden,
+                                    [TOK_TILE, K_CHUNK],
+                                    [row_base, k0],
+                                    valid_shape=[valid_tok, K_CHUNK],
+                                ),
+                                target_type=pl.FP32,
+                            ),
+                            [TOK_TILE, K_CHUNK],
+                        )
+                        sq_acc = pl.add(
+                            sq_acc,
+                            pl.reshape(
+                                pl.row_sum(pl.mul(x_chunk, x_chunk)),
+                                [TOK_TILE, 1],
+                            ),
+                        )
+
+                    inv_rms = pl.reshape(
+                        pl.rsqrt(pl.add(pl.mul(sq_acc, HIDDEN_INV), EPS)),
+                        [TOK_TILE, 1],
+                    )
+                    q_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.BF16)
+                    k_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN_CFG], dtype=pl.BF16)
+                    v_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN_CFG], dtype=pl.BF16)
+
+                    for ob in pl.range(Q_OUT_BLOCKS):
+                        q0 = ob * Q_OUT_CHUNK
+                        q_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                        q_acc = pl.mul(q_acc, 0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             x_chunk = pl.reshape(
@@ -147,81 +182,47 @@ def build_qwen3_single_layer_prefill_program(
                                 ),
                                 [TOK_TILE, K_CHUNK],
                             )
-                            sq_acc = pl.add(
-                                sq_acc,
-                                pl.reshape(
-                                    pl.row_sum(pl.mul(x_chunk, x_chunk)),
-                                    [TOK_TILE, 1],
-                                ),
+                            gamma = pl.slice(input_rms_weight, [TOK_TILE, K_CHUNK], [0, k0])
+                            normed = pl.mul(
+                                pl.row_expand_mul(x_chunk, pl.reshape(inv_rms, [TOK_TILE, 1])),
+                                gamma,
                             )
+                            wq_chunk = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                            q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
+                        q_proj_tile = pl.assemble(q_proj_tile, pl.cast(q_acc, target_type=pl.BF16), [0, q0])
 
-                        inv_rms = pl.reshape(
-                            pl.rsqrt(pl.add(pl.mul(sq_acc, HIDDEN_INV), EPS)),
-                            [TOK_TILE, 1],
-                        )
-                        q_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.BF16)
-                        k_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN_CFG], dtype=pl.BF16)
-                        v_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN_CFG], dtype=pl.BF16)
-
-                        for ob in pl.parallel(0, Q_OUT_BLOCKS, 1):
-                            q0 = ob * Q_OUT_CHUNK
-                            q_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
-                            q_acc = pl.mul(q_acc, 0.0)
-                            for kb in pl.range(HIDDEN_BLOCKS):
-                                k0 = kb * K_CHUNK
-                                x_chunk = pl.reshape(
-                                    pl.cast(
-                                        pl.slice(
-                                            flat_hidden,
-                                            [TOK_TILE, K_CHUNK],
-                                            [row_base, k0],
-                                            valid_shape=[valid_tok, K_CHUNK],
-                                        ),
-                                        target_type=pl.FP32,
+                    for ob in pl.range(KV_OUT_BLOCKS):
+                        kv0 = ob * KV_OUT_CHUNK
+                        k_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                        v_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                        k_acc = pl.mul(k_acc, 0.0)
+                        v_acc = pl.mul(v_acc, 0.0)
+                        for kb in pl.range(HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            x_chunk = pl.reshape(
+                                pl.cast(
+                                    pl.slice(
+                                        flat_hidden,
+                                        [TOK_TILE, K_CHUNK],
+                                        [row_base, k0],
+                                        valid_shape=[valid_tok, K_CHUNK],
                                     ),
-                                    [TOK_TILE, K_CHUNK],
-                                )
-                                gamma = pl.slice(input_rms_weight, [TOK_TILE, K_CHUNK], [0, k0])
-                                normed = pl.mul(
-                                    pl.row_expand_mul(x_chunk, pl.reshape(inv_rms, [TOK_TILE, 1])),
-                                    gamma,
-                                )
-                                wq_chunk = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
-                                q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
-                            q_proj_tile = pl.assemble(q_proj_tile, pl.cast(q_acc, target_type=pl.BF16), [0, q0])
-
-                        for ob in pl.parallel(0, KV_OUT_BLOCKS, 1):
-                            kv0 = ob * KV_OUT_CHUNK
-                            k_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                            v_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                            k_acc = pl.mul(k_acc, 0.0)
-                            v_acc = pl.mul(v_acc, 0.0)
-                            for kb in pl.range(HIDDEN_BLOCKS):
-                                k0 = kb * K_CHUNK
-                                x_chunk = pl.reshape(
-                                    pl.cast(
-                                        pl.slice(
-                                            flat_hidden,
-                                            [TOK_TILE, K_CHUNK],
-                                            [row_base, k0],
-                                            valid_shape=[valid_tok, K_CHUNK],
-                                        ),
-                                        target_type=pl.FP32,
-                                    ),
-                                    [TOK_TILE, K_CHUNK],
-                                )
-                                gamma = pl.slice(input_rms_weight, [TOK_TILE, K_CHUNK], [0, k0])
-                                normed = pl.mul(
-                                    pl.row_expand_mul(x_chunk, inv_rms),
-                                    gamma,
-                                )
-                                normed_bf16 = pl.cast(normed, target_type=pl.BF16)
-                                wk_chunk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                                wv_chunk = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                                k_acc = pl.add(k_acc, pl.matmul(normed_bf16, wk_chunk))
-                                v_acc = pl.add(v_acc, pl.matmul(normed_bf16, wv_chunk))
-                            k_proj_tile = pl.assemble(k_proj_tile, pl.cast(k_acc, target_type=pl.BF16), [0, kv0])
-                            v_proj_tile = pl.assemble(v_proj_tile, pl.cast(v_acc, target_type=pl.BF16), [0, kv0])
+                                    target_type=pl.FP32,
+                                ),
+                                [TOK_TILE, K_CHUNK],
+                            )
+                            gamma = pl.slice(input_rms_weight, [TOK_TILE, K_CHUNK], [0, k0])
+                            normed = pl.mul(
+                                pl.row_expand_mul(x_chunk, inv_rms),
+                                gamma,
+                            )
+                            normed_bf16 = pl.cast(normed, target_type=pl.BF16)
+                            wk_chunk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            wv_chunk = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            k_acc = pl.add(k_acc, pl.matmul(normed_bf16, wk_chunk))
+                            v_acc = pl.add(v_acc, pl.matmul(normed_bf16, wv_chunk))
+                        k_proj_tile = pl.assemble(k_proj_tile, pl.cast(k_acc, target_type=pl.BF16), [0, kv0])
+                        v_proj_tile = pl.assemble(v_proj_tile, pl.cast(v_acc, target_type=pl.BF16), [0, kv0])
 
                     # Scope 2: RoPE + KV cache update + causal attention.
                     # Loop bound must be a static TOK_TILE (not seq_len) so chunk /
@@ -288,7 +289,7 @@ def build_qwen3_single_layer_prefill_program(
 
                             attn_row = pl.full([1, HIDDEN_CFG], dtype=pl.BF16, value=0.0)
 
-                            for gi in pl.parallel(0, total_q_groups_cfg, 1):
+                            for gi in pl.range(total_q_groups_cfg):
                                 kvh = gi // q_groups_cfg
                                 qg = gi - kvh * q_groups_cfg
                                 q_base = kvh * Q_PER_KV_CFG + qg * Q_HEAD_BATCH_CFG
@@ -329,11 +330,23 @@ def build_qwen3_single_layer_prefill_program(
                                         dtype=pl.FP32,
                                         value=0.0,
                                     )
-                                    li = pl.full(
-                                        [Q_HEAD_BATCH_CFG, 1], dtype=pl.FP32, value=0.0
+                                    # [1, Q_HEAD_BATCH] ND matches ptoas spill views; use [H,1] only for
+                                    # row_expand_* (see qwen3_32b_decode_scope2.py).
+                                    li = pl.muls(
+                                        pl.create_tensor(
+                                            [1, Q_HEAD_BATCH_CFG],
+                                            dtype=pl.FP32,
+                                            layout=pl.TensorLayout.ND,
+                                        ),
+                                        0.0,
                                     )
-                                    mi = pl.full(
-                                        [Q_HEAD_BATCH_CFG, 1], dtype=pl.FP32, value=0.0
+                                    mi = pl.muls(
+                                        pl.create_tensor(
+                                            [1, Q_HEAD_BATCH_CFG],
+                                            dtype=pl.FP32,
+                                            layout=pl.TensorLayout.ND,
+                                        ),
+                                        0.0,
                                     )
 
                                 for sb in pl.range(ctx_blocks):
@@ -373,6 +386,8 @@ def build_qwen3_single_layer_prefill_program(
                                         exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
                                         exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
                                         cur_li = pl.row_sum(exp_scores_fp32)
+                                        cur_mi_nd = pl.reshape(cur_mi, [1, Q_HEAD_BATCH_CFG])
+                                        cur_li_nd = pl.reshape(cur_li, [1, Q_HEAD_BATCH_CFG])
                                         exp_padded = pl.assemble(exp_padded, exp_scores_bf16, [0, 0])
 
                                     oi_tmp_pad = pl.create_tensor(
@@ -396,21 +411,33 @@ def build_qwen3_single_layer_prefill_program(
                                         )
                                         if sb == 0:
                                             oi = oi_tmp
-                                            li = cur_li
-                                            mi = cur_mi
+                                            li = cur_li_nd
+                                            mi = cur_mi_nd
                                         else:
-                                            mi_new = pl.maximum(mi, cur_mi)
-                                            alpha = pl.exp(pl.sub(mi, mi_new))
-                                            beta = pl.exp(pl.sub(cur_mi, mi_new))
-                                            li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
+                                            mi_new = pl.maximum(mi, cur_mi_nd)
+                                            alpha_nd = pl.exp(pl.sub(mi, mi_new))
+                                            beta_nd = pl.exp(pl.sub(cur_mi_nd, mi_new))
+                                            li = pl.add(
+                                                pl.mul(alpha_nd, li),
+                                                pl.mul(beta_nd, cur_li_nd),
+                                            )
+                                            mi = mi_new
+                                            alpha = pl.reshape(
+                                                alpha_nd, [Q_HEAD_BATCH_CFG, 1]
+                                            )
+                                            beta = pl.reshape(
+                                                beta_nd, [Q_HEAD_BATCH_CFG, 1]
+                                            )
                                             oi = pl.add(
                                                 pl.row_expand_mul(oi, alpha),
                                                 pl.row_expand_mul(oi_tmp, beta),
                                             )
-                                            mi = mi_new
                                         # Same incore as merge so oi/li stay in scope (SSA); only last sb is final.
                                         if sb + 1 == ctx_blocks:
-                                            ctx = pl.row_expand_div(oi, li)
+                                            li_dn = pl.reshape(
+                                                li, [Q_HEAD_BATCH_CFG, 1]
+                                            )
+                                            ctx = pl.row_expand_div(oi, li_dn)
                                             ctx_flat = pl.reshape(
                                                 pl.cast(ctx, target_type=pl.BF16),
                                                 [1, Q_HEAD_BATCH_CFG * HEAD_DIM_CFG],
@@ -427,41 +454,37 @@ def build_qwen3_single_layer_prefill_program(
                                 [ti, 0],
                             )
 
-                    # Scope 3: WO + resid in auto_incore; post-RMS reduce in plain incore; then
-                    # post-norm + MLP in a second auto_incore.  Fusing [TOK_TILE,1] RMS acc with a
-                    # mixed UP_DOWN kernel makes the compiler emit Tile[[1, TOK_TILE]] temporaries;
-                    # SplitVector halves dim 0 and fails when that size is 1 (Ascend950).
-                    with pl.auto_incore(split=pl.SplitMode.UP_DOWN):
-                        resid1_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.FP32)
-                        for ob in pl.parallel(0, Q_OUT_BLOCKS):
-                            o0 = ob * Q_OUT_CHUNK
-                            zero_resid1 = pl.full([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                            resid1_tile = pl.assemble(resid1_tile, zero_resid1, [0, o0])
+                    # Scope 3: WO + resid; post-RMS in plain incore; post-norm + MLP + down (orchestrated).
+                    resid1_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.FP32)
+                    for ob in pl.range(Q_OUT_BLOCKS):
+                        o0 = ob * Q_OUT_CHUNK
+                        zero_resid1 = pl.full([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        resid1_tile = pl.assemble(resid1_tile, zero_resid1, [0, o0])
 
-                        for ob in pl.parallel(0, Q_OUT_BLOCKS, 1):
-                            o0 = ob * Q_OUT_CHUNK
-                            o_acc = pl.full([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                            for kb in pl.range(HIDDEN_BLOCKS):
-                                k0 = kb * K_CHUNK
-                                a_chunk = pl.cast(
-                                    pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, k0]),
-                                    target_type=pl.BF16,
-                                )
-                                w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
-                                o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
-                            resid = pl.reshape(
-                                pl.cast(
-                                    pl.slice(
-                                        flat_hidden,
-                                        [TOK_TILE, Q_OUT_CHUNK],
-                                        [row_base, o0],
-                                        valid_shape=[valid_tok, Q_OUT_CHUNK],
-                                    ),
-                                    target_type=pl.FP32,
-                                ),
-                                [TOK_TILE, Q_OUT_CHUNK],
+                    for ob in pl.range(Q_OUT_BLOCKS):
+                        o0 = ob * Q_OUT_CHUNK
+                        o_acc = pl.full([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        for kb in pl.range(HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            a_chunk = pl.cast(
+                                pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, k0]),
+                                target_type=pl.BF16,
                             )
-                            resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
+                            w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
+                            o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
+                        resid = pl.reshape(
+                            pl.cast(
+                                pl.slice(
+                                    flat_hidden,
+                                    [TOK_TILE, Q_OUT_CHUNK],
+                                    [row_base, o0],
+                                    valid_shape=[valid_tok, Q_OUT_CHUNK],
+                                ),
+                                target_type=pl.FP32,
+                            ),
+                            [TOK_TILE, Q_OUT_CHUNK],
+                        )
+                        resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
 
                     with pl.incore():
                         sq_acc_post = pl.full([TOK_TILE, 1], dtype=pl.FP32, value=0.0)
@@ -480,63 +503,62 @@ def build_qwen3_single_layer_prefill_program(
                             [TOK_TILE, 1],
                         )
 
-                    with pl.auto_incore(split=pl.SplitMode.UP_DOWN):
-                        post_norm_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.BF16)
-                        down_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.FP32)
-                        for zi in pl.range(HIDDEN_BLOCKS):
-                            z0 = zi * K_CHUNK
-                            down_zero_chunk = pl.full([TOK_TILE, K_CHUNK], dtype=pl.FP32, value=0.0)
-                            down_proj_tile = pl.assemble(down_proj_tile, down_zero_chunk, [0, z0])
+                    post_norm_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.BF16)
+                    down_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.FP32)
+                    for zi in pl.range(HIDDEN_BLOCKS):
+                        z0 = zi * K_CHUNK
+                        down_zero_chunk = pl.full([TOK_TILE, K_CHUNK], dtype=pl.FP32, value=0.0)
+                        down_proj_tile = pl.assemble(down_proj_tile, down_zero_chunk, [0, z0])
+
+                    for kb in pl.range(HIDDEN_BLOCKS):
+                        k0 = kb * K_CHUNK
+                        x_chunk = pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                        gamma = pl.slice(post_rms_weight, [TOK_TILE, K_CHUNK], [0, k0])
+                        normed = pl.mul(
+                            pl.row_expand_mul(x_chunk, inv_rms_post),
+                            gamma,
+                        )
+                        post_norm_tile = pl.assemble(
+                            post_norm_tile,
+                            pl.cast(normed, target_type=pl.BF16),
+                            [0, k0],
+                        )
+
+                    for ob in pl.range(MLP_OUT_BLOCKS):
+                        o0 = ob * MLP_OUT_CHUNK
+                        gate_acc = pl.full([TOK_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        up_acc = pl.full([TOK_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
 
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            x_chunk = pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, k0])
-                            gamma = pl.slice(post_rms_weight, [TOK_TILE, K_CHUNK], [0, k0])
-                            normed = pl.mul(
-                                pl.row_expand_mul(x_chunk, inv_rms_post),
-                                gamma,
-                            )
-                            post_norm_tile = pl.assemble(
-                                post_norm_tile,
-                                pl.cast(normed, target_type=pl.BF16),
-                                [0, k0],
-                            )
+                            post_chunk = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                            wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
+                            wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
+                            gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
+                            up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
 
-                        for ob in pl.range(MLP_OUT_BLOCKS):
-                            o0 = ob * MLP_OUT_CHUNK
-                            gate_acc = pl.full([TOK_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                            up_acc = pl.full([TOK_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
+                        mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
+                        mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
 
-                            for kb in pl.range(HIDDEN_BLOCKS):
-                                k0 = kb * K_CHUNK
-                                post_chunk = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, k0])
-                                wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                                wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                                gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
-                                up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
+                        for dob in pl.range(HIDDEN_BLOCKS):
+                            d0 = dob * K_CHUNK
+                            down_prev = pl.slice(down_proj_tile, [TOK_TILE, K_CHUNK], [0, d0])
+                            w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
+                            down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
+                            down_proj_tile = pl.assemble(down_proj_tile, down_next, [0, d0])
 
-                            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
-                            mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
-                            mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
-
-                            for dob in pl.parallel(0, HIDDEN_BLOCKS, 1, chunk=4):
-                                d0 = dob * K_CHUNK
-                                down_prev = pl.slice(down_proj_tile, [TOK_TILE, K_CHUNK], [0, d0])
-                                w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
-                                down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
-                                down_proj_tile = pl.assemble(down_proj_tile, down_next, [0, d0])
-
-                        for ob in pl.parallel(0, HIDDEN_BLOCKS, 1, chunk=4):
-                            o0 = ob * K_CHUNK
-                            down_acc = pl.add(
-                                pl.slice(down_proj_tile, [TOK_TILE, K_CHUNK], [0, o0]),
-                                pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, o0]),
-                            )
-                            out = pl.assemble(
-                                out,
-                                pl.cast(down_acc, target_type=pl.BF16),
-                                [b, p0, o0],
-                            )
+                    for ob in pl.range(HIDDEN_BLOCKS):
+                        o0 = ob * K_CHUNK
+                        down_acc = pl.add(
+                            pl.slice(down_proj_tile, [TOK_TILE, K_CHUNK], [0, o0]),
+                            pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, o0]),
+                        )
+                        out = pl.assemble(
+                            out,
+                            pl.cast(down_acc, target_type=pl.BF16),
+                            [b, p0, o0],
+                        )
 
             return out
 
