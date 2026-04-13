@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -17,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -292,14 +294,22 @@ class FuseCreateAssembleMutator : public IRMutator {
 
     size_t ndim = result_type->shape_.size();
 
+    auto offset_tuple = std::static_pointer_cast<const MakeTuple>(info.offset_tuple);
+    size_t offset_ndim = offset_tuple->elements_.size();
+
+    // When the assemble target has higher rank than the created tile
+    // (e.g. 2D tile assembled into a 3D tensor), pad the shape with
+    // leading singleton dimensions so that shape and offset ranks match
+    // in the resulting tensor.slice.
     std::vector<ExprPtr> shape_elements;
-    shape_elements.reserve(ndim);
+    shape_elements.reserve(std::max(ndim, offset_ndim));
+    for (size_t i = ndim; i < offset_ndim; ++i) {
+      shape_elements.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, assign->span_));
+    }
     for (const auto& dim : result_type->shape_) {
       shape_elements.push_back(dim);
     }
     auto shape_tuple = std::make_shared<MakeTuple>(std::move(shape_elements), assign->span_);
-
-    auto offset_tuple = std::static_pointer_cast<const MakeTuple>(info.offset_tuple);
 
     ExprPtr target = VisitExpr(info.target_expr);
 

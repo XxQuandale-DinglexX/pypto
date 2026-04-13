@@ -558,6 +558,84 @@ class TestAssembleParentStrides:
         After = passes.optimize_orch_tensors()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_3d_parent_out_param_gets_trailing_stride(self):
+        """When parent tensor is 3D and output tile is 2D, only trailing strides are applied."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def proj_incore_0(
+                self,
+                x: pl.Tensor[[16, 5120], pl.FP32],
+                q0: pl.Scalar[pl.INDEX],
+                ret0__out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                x__tile: pl.Tile[[16, 64], pl.FP32] = pl.load(x, [0, q0], [16, 64])
+                ret0__store: pl.Tensor[[16, 64], pl.FP32] = pl.store(x__tile, [0, 0], ret0__out)
+                return ret0__store
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def proj(
+                self,
+                x: pl.Tensor[[16, 5120], pl.FP32],
+                q_proj: pl.Out[pl.Tensor[[4, 128, 5120], pl.FP32]],
+            ) -> pl.Tensor[[4, 128, 5120], pl.FP32]:
+                for b in pl.range(4):
+                    for p0 in pl.range(0, 128, 16):
+                        for q0, (q_iter,) in pl.range(0, 5120, 64, init_values=(q_proj,)):
+                            ret0__out: pl.Tensor[[16, 64], pl.FP32] = pl.create_tensor(
+                                [16, 64], dtype=pl.FP32
+                            )
+                            result: pl.Tensor[[16, 64], pl.FP32] = self.proj_incore_0(x, q0, ret0__out)
+                            q_next: pl.Tensor[[4, 128, 5120], pl.FP32] = pl.assemble(
+                                q_iter, result, [b, p0, q0]
+                            )
+                            q_rv = pl.yield_(q_next)
+                return q_rv
+
+        # fmt: off
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def proj_incore_0(
+                self,
+                x: pl.Tensor[[16, 5120], pl.FP32],
+                q0: pl.Scalar[pl.INDEX],
+                ret0__out: pl.Out[  # noqa: E501
+                    pl.Tensor[[16, 64], pl.FP32, pl.TensorView(stride=[5120, 1], layout=pl.TensorLayout.ND)]
+                ],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                x__tile: pl.Tile[[16, 64], pl.FP32] = pl.load(x, [0, q0], [16, 64])
+                ret0__store: pl.Tensor[  # noqa: E501
+                    [16, 64], pl.FP32, pl.TensorView(stride=[5120, 1], layout=pl.TensorLayout.ND)
+                ] = pl.store(x__tile, [0, 0], ret0__out)
+                return ret0__store
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def proj(
+                self,
+                x: pl.Tensor[[16, 5120], pl.FP32],
+                q_proj: pl.Out[pl.Tensor[[4, 128, 5120], pl.FP32]],
+            ) -> pl.Tensor[[4, 128, 5120], pl.FP32]:
+                for b in pl.range(4):
+                    for p0 in pl.range(0, 128, 16):
+                        for q0, (q_iter,) in pl.range(0, 5120, 64, init_values=(q_proj,)):
+                            ret0__out: pl.Tensor[[16, 64], pl.FP32] = pl.create_tensor(
+                                [16, 64], dtype=pl.FP32
+                            )
+                            result: pl.Tensor[[16, 64], pl.FP32] = self.proj_incore_0(
+                                x, q0, ret0__out
+                            )
+                            q_next: pl.Tensor[[4, 128, 5120], pl.FP32] = pl.assemble(
+                                q_iter, result, [b, p0, q0]
+                            )
+                            q_rv = pl.yield_(q_next)
+                return q_rv
+        # fmt: on
+
+        After = passes.optimize_orch_tensors()(Before)
+        ir.assert_structural_equal(After, Expected)
+
 
 class TestAssembleLoopRewrite:
     """Pattern 3: Rewrite tile.assemble loops to tile.store loops."""

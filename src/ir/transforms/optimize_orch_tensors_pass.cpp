@@ -1030,11 +1030,19 @@ class AssembleParentStridesOptimizer {
         auto shape_it = return_idx_to_shape.find(opm.return_index);
         if (shape_it == return_idx_to_shape.end()) continue;
 
-        auto strides = ComputeStrides(shape_it->second);
-        if (strides.empty()) continue;
+        auto full_strides = ComputeStrides(shape_it->second);
+        if (full_strides.empty()) continue;
 
         auto tensor_type = As<TensorType>(func->params_[opm.param_index]->GetType());
         if (!tensor_type) continue;
+
+        // Extract trailing strides matching the output tensor's rank.
+        // For a 3D parent [B, M, N] with strides [M*N, N, 1] and a 2D output [M', N'],
+        // we need the last 2 strides: [N, 1].
+        size_t out_rank = tensor_type->shape_.size();
+        if (out_rank > full_strides.size()) continue;
+        std::vector<ExprPtr> strides(full_strides.end() - static_cast<std::ptrdiff_t>(out_rank),
+                                     full_strides.end());
 
         TensorView view(std::move(strides), TensorLayout::ND);
         auto new_type = std::make_shared<TensorType>(tensor_type->shape_, tensor_type->dtype_,
