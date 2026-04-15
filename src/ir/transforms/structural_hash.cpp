@@ -269,6 +269,14 @@ class StructuralHasher {
     return h;
   }
 
+  // Required by the template instantiation path for Stmt::leading_comments_
+  // (IgnoreField). VisitIgnoreField discards the lambda at runtime, so this
+  // overload should never be called — guard it like the Span overload.
+  result_type VisitLeafField(const std::vector<std::string>& /*field*/) {
+    INTERNAL_UNREACHABLE << "structural_hash should not visit leading_comments field";
+    return 0;  // Never reached
+  }
+
   // Hash kwargs (vector of pairs - order is preserved and matters)
   result_type VisitLeafField(const std::vector<std::pair<std::string, std::any>>& kwargs) {
     result_type h = 0;

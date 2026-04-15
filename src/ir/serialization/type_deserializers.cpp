@@ -48,6 +48,39 @@ using DeserializerContext = serialization::detail::DeserializerContext;
 #define GET_FIELD(Type, name) ctx.GetField<Type>(fields_obj, name)
 #define GET_FIELD_OBJ(name) ctx.GetFieldObj(fields_obj, name)
 
+// Extract a stmt's "leading_comments" field (absent ⇒ empty vector). Symmetric with
+// DeserializeSpan — each Stmt deserializer passes the result as the last ctor arg so
+// leading_comments is initialized at construction time, not attached after the fact.
+//
+// A missing field silently defaults to empty (backward compat with older .pto blobs).
+// A present field with an unexpected type raises — silently treating malformed data
+// as "no comments" would hide serializer/deserializer mismatches.
+static std::vector<std::string> DeserializeLeadingComments(const msgpack::object& fields_obj) {
+  std::vector<std::string> comments;
+  if (fields_obj.type != msgpack::type::MAP) return comments;
+  msgpack::object_kv* p = fields_obj.via.map.ptr;
+  msgpack::object_kv* const pend = fields_obj.via.map.ptr + fields_obj.via.map.size;
+  for (; p < pend; ++p) {
+    std::string key;
+    p->key.convert(key);
+    if (key != "leading_comments") continue;
+    CHECK(p->val.type == msgpack::type::ARRAY)
+        << "Deserializer: 'leading_comments' must be a string array, got msgpack type "
+        << static_cast<int>(p->val.type);
+    comments.reserve(p->val.via.array.size);
+    for (uint32_t i = 0; i < p->val.via.array.size; ++i) {
+      CHECK(p->val.via.array.ptr[i].type == msgpack::type::STR)
+          << "Deserializer: 'leading_comments[" << i << "]' must be a string, got msgpack type "
+          << static_cast<int>(p->val.via.array.ptr[i].type);
+      std::string text;
+      p->val.via.array.ptr[i].convert(text);
+      comments.push_back(std::move(text));
+    }
+    break;
+  }
+  return comments;
+}
+
 // Helper function to get optional field (returns nullopt if field doesn't exist or is null)
 static std::optional<msgpack::object> GetOptionalFieldObj(const msgpack::object& fields_obj,
                                                           const std::string& field_name,
@@ -363,7 +396,7 @@ static IRNodePtr DeserializeAssignStmt(const msgpack::object& fields_obj, msgpac
   auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
   auto var = std::static_pointer_cast<const Var>(ctx.DeserializeNode(GET_FIELD_OBJ("var"), zone));
   auto value = std::static_pointer_cast<const Expr>(ctx.DeserializeNode(GET_FIELD_OBJ("value"), zone));
-  return std::make_shared<AssignStmt>(var, value, span);
+  return std::make_shared<AssignStmt>(var, value, span, DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize IfStmt
@@ -393,7 +426,8 @@ static IRNodePtr DeserializeIfStmt(const msgpack::object& fields_obj, msgpack::z
     }
   }
 
-  return std::make_shared<IfStmt>(condition, then_body, else_body, return_vars, span);
+  return std::make_shared<IfStmt>(condition, then_body, else_body, return_vars, span,
+                                  DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize YieldStmt
@@ -410,7 +444,7 @@ static IRNodePtr DeserializeYieldStmt(const msgpack::object& fields_obj, msgpack
     }
   }
 
-  return std::make_shared<YieldStmt>(value, span);
+  return std::make_shared<YieldStmt>(value, span, DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize ReturnStmt
@@ -427,7 +461,7 @@ static IRNodePtr DeserializeReturnStmt(const msgpack::object& fields_obj, msgpac
     }
   }
 
-  return std::make_shared<ReturnStmt>(value, span);
+  return std::make_shared<ReturnStmt>(value, span, DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize ForStmt
@@ -498,7 +532,7 @@ static IRNodePtr DeserializeForStmt(const msgpack::object& fields_obj, msgpack::
   }
 
   return std::make_shared<ForStmt>(loop_var, start, stop, step, iter_args, body, return_vars, span, kind,
-                                   chunk_config, std::move(attrs));
+                                   chunk_config, std::move(attrs), DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize WhileStmt
@@ -529,7 +563,8 @@ static IRNodePtr DeserializeWhileStmt(const msgpack::object& fields_obj, msgpack
     }
   }
 
-  return std::make_shared<WhileStmt>(condition, iter_args, body, return_vars, span);
+  return std::make_shared<WhileStmt>(condition, iter_args, body, return_vars, span,
+                                     DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize ScopeStmt
@@ -572,7 +607,8 @@ static IRNodePtr DeserializeScopeStmt(const msgpack::object& fields_obj, msgpack
   // Deserialize body
   auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
 
-  return std::make_shared<ScopeStmt>(scope_kind, body, span, level, role, split, std::move(name_hint));
+  return std::make_shared<ScopeStmt>(scope_kind, body, span, level, role, split, std::move(name_hint),
+                                     DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize SeqStmts
@@ -597,21 +633,21 @@ static IRNodePtr DeserializeEvalStmt(const msgpack::object& fields_obj, msgpack:
                                      DeserializerContext& ctx) {
   auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
   auto expr = std::static_pointer_cast<const Expr>(ctx.DeserializeNode(GET_FIELD_OBJ("expr"), zone));
-  return std::make_shared<EvalStmt>(expr, span);
+  return std::make_shared<EvalStmt>(expr, span, DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize BreakStmt
 static IRNodePtr DeserializeBreakStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
                                       DeserializerContext& ctx) {
   auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
-  return std::make_shared<BreakStmt>(span);
+  return std::make_shared<BreakStmt>(span, DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize ContinueStmt
 static IRNodePtr DeserializeContinueStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
                                          DeserializerContext& ctx) {
   auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
-  return std::make_shared<ContinueStmt>(span);
+  return std::make_shared<ContinueStmt>(span, DeserializeLeadingComments(fields_obj));
 }
 
 // Deserialize Function

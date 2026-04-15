@@ -599,6 +599,15 @@ class StructuralEqualImpl {
     return true;  // Never reached
   }
 
+  // Required by the template instantiation path for Stmt::leading_comments_
+  // (IgnoreField). VisitIgnoreField discards the lambda at runtime, so this
+  // overload should never be called — guard it like the Span overload.
+  result_type VisitLeafField(const std::vector<std::string>& /*lhs*/,
+                             const std::vector<std::string>& /*rhs*/) {
+    INTERNAL_UNREACHABLE << "structural_equal should not visit leading_comments field";
+    return true;  // Never reached
+  }
+
   // Field kind hooks
   template <typename FVisitOp>
   void VisitIgnoreField([[maybe_unused]] FVisitOp&& visit_op) {

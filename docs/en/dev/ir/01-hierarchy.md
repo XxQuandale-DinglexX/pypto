@@ -144,6 +144,9 @@ for_stmt = ir.ForStmt(i, start, stop, step, [sum_iter], body, [sum_final], span)
 
 ## Statement Nodes
 
+All `Stmt` subclasses inherit a `leading_comments_: vector<string>` metadata
+field from the `Stmt` base class. See [Leading comments on statements](#leading-comments-on-statements) below.
+
 | Node Type | Fields | Description |
 | --------- | ------ | ----------- |
 | **AssignStmt** | `var_` (DefField), `value_` (UsualField) | Variable assignment |
@@ -156,6 +159,64 @@ for_stmt = ir.ForStmt(i, start, stop, step, [sum_iter], body, [sum_final], span)
 | **SeqStmts** | `stmts_` | General statement sequence |
 | **BreakStmt** | *(none)* | Exit loop |
 | **ContinueStmt** | *(none)* | Skip to next loop iteration |
+
+### Leading comments on statements
+
+Each `Stmt` carries an optional `leading_comments_: vector<string>` field that
+preserves source-level `#` comments and bare-string docstrings from the Python
+DSL. The printer emits each line as `# <text>` directly above the stmt.
+
+- **Constructor arg (symmetric with `span_`).** Every `Stmt` subclass
+  constructor takes `leading_comments` as its last parameter (defaulted to
+  `{}`). Deserializers read `"leading_comments"` from the fields map and pass
+  it alongside `"span"` — the field is initialized at construction time, not
+  attached after the fact.
+- **Registered as `IgnoreField`.** Comments survive binary serialization
+  (`serialize_to_file`), but do NOT participate in `structural_equal` or
+  structural hashing. Two stmts that differ only in `leading_comments_`
+  compare and hash equal.
+- **Read-only from Python.** `stmt.leading_comments` is exposed read-only. The
+  sanctioned mutation channel is the free function `ir.attach_leading_comments(stmt, comments)`,
+  used by the parser builder and comment-merging passes for late binding.
+- **Parser attachment rules.** For simple stmts, comments on lines up to the
+  stmt's `end_lineno` are drained as leading — this means same-line trailing
+  comments (`y = 1  # note`) attach to the same stmt, not the next one. For
+  compound stmts (`for`/`while`/`if`/`with`), draining caps at the header's
+  first line so body-inner comments are left for the body stmts. Bare-string
+  expressions (docstrings) anywhere in the body become leading comments on
+  the next stmt.
+- **Tail-of-block comments.** Comments after the last stmt in a block (at the
+  block's indentation) have no natural attachment target and are dropped with a
+  `UserWarning`. Move them above a stmt or into the outer scope to retain them.
+  Column info is used to distinguish genuine tail-of-block comments from
+  outer-scope comments that merely appear on intervening lines (e.g. `# fallback`
+  between a then-body and `else:`).
+- **SeqStmts invariant.** `SeqStmts` is a transparent container and must not
+  carry `leading_comments_`; comments always attach to inner (non-Seq) stmts.
+- **Pass propagation.** IR passes that rebuild stmts use `MutableCopy(op)` +
+  field assignment — the copy auto-preserves `leading_comments_` together with
+  every other unchanged field. When a pass splits one stmt into several (e.g.
+  `expand_mixed_kernel` expanding an `InCore` call into AIC + AIV), construct
+  the split-first stmt via `std::make_shared<NewT>(..., orig->leading_comments_)`
+  so the origin's comments attach there. When a pass erases a compound stmt
+  (e.g. `unroll_loops` eliminating a `ForStmt`), its comments are forwarded
+  onto the first surviving body stmt via `AttachLeadingComments`.
+
+```python
+# DSL
+"""cache intermediate"""
+# reuse later
+y = x + 1  # for performance
+
+# Parsed
+# AssignStmt.leading_comments == ["cache intermediate", "reuse later", "for performance"]
+
+# Printed
+# cache intermediate
+# reuse later
+# for performance
+y: f32 = x + 1
+```
 
 ### ForStmt Details
 

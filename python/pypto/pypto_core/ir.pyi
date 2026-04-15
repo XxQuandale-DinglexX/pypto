@@ -1545,6 +1545,13 @@ class Cast(UnaryExpr):
 class Stmt(IRNode):
     """Base class for all statements."""
 
+    leading_comments: Final[list[str]]
+    """Source-level comments printed above this statement.
+
+    IgnoreField metadata — never participates in structural_equal or hashing.
+    Read-only from Python; use :func:`attach_leading_comments` to modify.
+    """
+
     def __init__(self, span: Span) -> None:
         """Create a statement.
 
@@ -2119,6 +2126,22 @@ def assert_structural_equal(
         ValueError: If objects are not structurally equal, with detailed diagnostic message
     """
 
+def attach_leading_comments(stmt: Stmt, comments: list[str]) -> Stmt:
+    """Attach leading comments to an existing statement.
+
+    ``Stmt.leading_comments`` is read-only from Python; this helper is the
+    sanctioned mutation channel for IgnoreField metadata (e.g., used by the
+    DSL parser to attach extracted source comments). The input statement is
+    mutated in place and returned.
+
+    Args:
+        stmt: Statement to annotate
+        comments: Comment lines (without leading ``#``)
+
+    Returns:
+        The same statement, with ``leading_comments`` replaced by ``comments``
+    """
+
 @overload
 def memref_init(func: Function) -> Function: ...
 @overload
@@ -2659,6 +2682,22 @@ class IRBuilder:
 
         Args:
             stmt: Statement to emit
+        """
+
+    def push_pending_leading_comments(self, comments: list[str]) -> None:
+        """Push leading comments onto the pending stack.
+
+        The DSL parser calls this before dispatching to a ``parse_*`` helper.
+        Pair every push with exactly one ``pop_pending_leading_comments``.
+
+        Args:
+            comments: Comment lines (without leading ``#``)
+        """
+
+    def pop_pending_leading_comments(self) -> list[str]:
+        """Pop the top pending entry, returning whatever stayed unconsumed.
+
+        Returns ``[]`` when the matching emit already consumed the queue.
         """
 
     def assign(self, var: Var, value: Expr, span: Span) -> AssignStmt:

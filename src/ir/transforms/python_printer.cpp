@@ -285,6 +285,10 @@ class IRPythonPrinter : public IRVisitor {
   // SeqStmts is a transparent container - recursed into without extra indent.
   void PrintStmtBlock(const StmtPtr& stmt);
 
+  // Emit each leading comment line of `stmt` as `# <text>` above the stmt itself.
+  // Assumes the current indent has already been written to the stream.
+  void PrintLeadingComments(const StmtPtr& stmt);
+
   // Statement body visitor with SSA-style handling
   void VisitStmtBody(const StmtPtr& body, const std::vector<VarPtr>& return_vars = {});
   void PrintYieldAssignmentVars(const std::vector<VarPtr>& return_vars);
@@ -1084,14 +1088,22 @@ void IRPythonPrinter::VisitStmt_(const SeqStmtsPtr& op) {
   }
 }
 
+void IRPythonPrinter::PrintLeadingComments(const StmtPtr& stmt) {
+  for (const auto& line : stmt->leading_comments_) {
+    stream_ << "# " << line << "\n" << GetIndent();
+  }
+}
+
 void IRPythonPrinter::PrintStmtBlock(const StmtPtr& stmt) {
   if (auto seq = As<SeqStmts>(stmt)) {
+    INTERNAL_CHECK(seq->leading_comments_.empty()) << "SeqStmts should not carry leading comments directly";
     for (size_t i = 0; i < seq->stmts_.size(); ++i) {
       PrintStmtBlock(seq->stmts_[i]);
       if (i < seq->stmts_.size() - 1) stream_ << "\n";
     }
   } else {
     stream_ << GetIndent();
+    PrintLeadingComments(stmt);
     VisitStmt(stmt);
   }
 }
@@ -1127,6 +1139,7 @@ void IRPythonPrinter::VisitStmtBody(const StmtPtr& body, const std::vector<VarPt
     // If parent has return_vars, wrap yield as assignment
     if (!yield_stmt->value_.empty() && !return_vars.empty()) {
       stream_ << GetIndent();
+      PrintLeadingComments(yield_stmt);
       PrintYieldAssignmentVars(return_vars);
       stream_ << " = " << prefix_ << ".yield_(";
       for (size_t i = 0; i < yield_stmt->value_.size(); ++i) {
@@ -1136,6 +1149,7 @@ void IRPythonPrinter::VisitStmtBody(const StmtPtr& body, const std::vector<VarPt
       stream_ << ")";
     } else {
       stream_ << GetIndent();
+      PrintLeadingComments(yield_stmt);
       VisitStmt(yield_stmt);
     }
   } else if (auto seq_stmts = As<SeqStmts>(body)) {
@@ -1153,6 +1167,7 @@ void IRPythonPrinter::VisitStmtBody(const StmtPtr& body, const std::vector<VarPt
         if (is_last && !yield_stmt->value_.empty() && !return_vars.empty()) {
           // Wrap as assignment
           stream_ << GetIndent();
+          PrintLeadingComments(yield_stmt);
           PrintYieldAssignmentVars(return_vars);
           stream_ << " = " << prefix_ << ".yield_(";
           for (size_t j = 0; j < yield_stmt->value_.size(); ++j) {
@@ -1162,6 +1177,7 @@ void IRPythonPrinter::VisitStmtBody(const StmtPtr& body, const std::vector<VarPt
           stream_ << ")";
         } else {
           stream_ << GetIndent();
+          PrintLeadingComments(yield_stmt);
           VisitStmt(stmt);
         }
       } else {
@@ -1292,7 +1308,9 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
         for (size_t i = 0; i < seq_stmts->stmts_.size(); ++i) {
           // Convert yield to return in function context
           if (auto yield_stmt = As<YieldStmt>(seq_stmts->stmts_[i])) {
-            stream_ << GetIndent() << "return";
+            stream_ << GetIndent();
+            PrintLeadingComments(yield_stmt);
+            stream_ << "return";
             if (!yield_stmt->value_.empty()) {
               stream_ << " ";
               for (size_t j = 0; j < yield_stmt->value_.size(); ++j) {
@@ -1309,7 +1327,9 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
         }
       }
     } else if (auto yield_stmt = As<YieldStmt>(func->body_)) {
-      stream_ << GetIndent() << "return";
+      stream_ << GetIndent();
+      PrintLeadingComments(yield_stmt);
+      stream_ << "return";
       if (!yield_stmt->value_.empty()) {
         stream_ << " ";
         for (size_t i = 0; i < yield_stmt->value_.size(); ++i) {

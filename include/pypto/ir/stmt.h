@@ -297,8 +297,10 @@ class Stmt : public IRNode {
    * @brief Create a statement
    *
    * @param span Source location
+   * @param leading_comments Source-level comments to print above this statement (defaults to empty)
    */
-  explicit Stmt(Span s) : IRNode(std::move(s)) {}
+  explicit Stmt(Span s, std::vector<std::string> leading_comments = {})
+      : IRNode(std::move(s)), leading_comments_(std::move(leading_comments)) {}
   ~Stmt() override = default;
 
   /**
@@ -308,7 +310,20 @@ class Stmt : public IRNode {
    */
   [[nodiscard]] std::string TypeName() const override { return "Stmt"; }
 
-  static constexpr auto GetFieldDescriptors() { return IRNode::GetFieldDescriptors(); }
+  // Source-level comments printed above this statement.
+  //
+  // Registered as IgnoreField so it does NOT participate in structural equality
+  // or hashing (purely DSL-level annotation metadata). It IS serialized/deserialized
+  // so comments survive `serialize_to_file` round-trips. Passed through the Stmt
+  // constructor (symmetric with span_). Exposed to Python as read-only; the
+  // late-binding mutation channel is AttachLeadingComments (used by the parser
+  // builder and comment-merging passes).
+  std::vector<std::string> leading_comments_;
+
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(IRNode::GetFieldDescriptors(), std::make_tuple(reflection::IgnoreField(
+                                                             &Stmt::leading_comments_, "leading_comments")));
+  }
 };
 
 using StmtPtr = std::shared_ptr<const Stmt>;
@@ -331,8 +346,8 @@ class AssignStmt : public Stmt {
    * @param value Expression
    * @param span Source location
    */
-  AssignStmt(VarPtr var, ExprPtr value, Span span)
-      : Stmt(std::move(span)), var_(std::move(var)), value_(std::move(value)) {}
+  AssignStmt(VarPtr var, ExprPtr value, Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)), var_(std::move(var)), value_(std::move(value)) {}
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::AssignStmt; }
   [[nodiscard]] std::string TypeName() const override { return "AssignStmt"; }
@@ -369,8 +384,8 @@ class IfStmt : public Stmt {
    * @param span Source location
    */
   IfStmt(ExprPtr condition, StmtPtr then_body, std::optional<StmtPtr> else_body,
-         std::vector<VarPtr> return_vars, Span span)
-      : Stmt(std::move(span)),
+         std::vector<VarPtr> return_vars, Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)),
         condition_(std::move(condition)),
         then_body_(std::move(then_body)),
         else_body_(std::move(else_body)),
@@ -415,14 +430,16 @@ class YieldStmt : public Stmt {
    * @param value List of variables to yield (can be empty)
    * @param span Source location
    */
-  YieldStmt(std::vector<ExprPtr> value, Span span) : Stmt(std::move(span)), value_(std::move(value)) {}
+  YieldStmt(std::vector<ExprPtr> value, Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)), value_(std::move(value)) {}
 
   /**
    * @brief Create a yield statement without values
    *
    * @param span Source location
    */
-  explicit YieldStmt(Span span) : Stmt(std::move(span)), value_() {}
+  explicit YieldStmt(Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)), value_() {}
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::YieldStmt; }
   [[nodiscard]] std::string TypeName() const override { return "YieldStmt"; }
@@ -457,14 +474,16 @@ class ReturnStmt : public Stmt {
    * @param value List of expressions to return (can be empty)
    * @param span Source location
    */
-  ReturnStmt(std::vector<ExprPtr> value, Span span) : Stmt(std::move(span)), value_(std::move(value)) {}
+  ReturnStmt(std::vector<ExprPtr> value, Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)), value_(std::move(value)) {}
 
   /**
    * @brief Create a return statement without values
    *
    * @param span Source location
    */
-  explicit ReturnStmt(Span span) : Stmt(std::move(span)), value_() {}
+  explicit ReturnStmt(Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)), value_() {}
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::ReturnStmt; }
   [[nodiscard]] std::string TypeName() const override { return "ReturnStmt"; }
@@ -525,8 +544,9 @@ class ForStmt : public Stmt {
   ForStmt(VarPtr loop_var, ExprPtr start, ExprPtr stop, ExprPtr step, std::vector<IterArgPtr> iter_args,
           StmtPtr body, std::vector<VarPtr> return_vars, Span span, ForKind kind = ForKind::Sequential,
           std::optional<ChunkConfig> chunk_config = std::nullopt,
-          std::vector<std::pair<std::string, std::any>> attrs = {})
-      : Stmt(std::move(span)),
+          std::vector<std::pair<std::string, std::any>> attrs = {},
+          std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)),
         loop_var_(std::move(loop_var)),
         start_(std::move(start)),
         stop_(std::move(stop)),
@@ -638,8 +658,8 @@ class WhileStmt : public Stmt {
    * @param span Source location
    */
   WhileStmt(ExprPtr condition, std::vector<IterArgPtr> iter_args, StmtPtr body,
-            std::vector<VarPtr> return_vars, Span span)
-      : Stmt(std::move(span)),
+            std::vector<VarPtr> return_vars, Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)),
         condition_(std::move(condition)),
         iter_args_(std::move(iter_args)),
         body_(std::move(body)),
@@ -709,8 +729,8 @@ class ScopeStmt : public Stmt {
    * @param body The nested statements
    * @param span Source location
    */
-  ScopeStmt(ScopeKind scope_kind, StmtPtr body, Span span)
-      : Stmt(std::move(span)), scope_kind_(scope_kind), body_(std::move(body)) {}
+  ScopeStmt(ScopeKind scope_kind, StmtPtr body, Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)), scope_kind_(scope_kind), body_(std::move(body)) {}
 
   /**
    * @brief Create a scope statement with hierarchy level, role, and split mode
@@ -724,8 +744,8 @@ class ScopeStmt : public Stmt {
    */
   ScopeStmt(ScopeKind scope_kind, StmtPtr body, Span span, std::optional<Level> level,
             std::optional<Role> role = std::nullopt, std::optional<SplitMode> split = std::nullopt,
-            std::string name_hint = "")
-      : Stmt(std::move(span)),
+            std::string name_hint = "", std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)),
         scope_kind_(scope_kind),
         body_(std::move(body)),
         level_(level),
@@ -778,7 +798,12 @@ class SeqStmts : public Stmt {
    * @param stmts List of statements
    * @param span Source location
    */
-  SeqStmts(std::vector<StmtPtr> stmts, Span span) : Stmt(std::move(span)), stmts_(std::move(stmts)) {}
+  SeqStmts(std::vector<StmtPtr> stmts, Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)), stmts_(std::move(stmts)) {
+    INTERNAL_CHECK(leading_comments_.empty())
+        << "SeqStmts is a transparent container and must not carry leading comments; "
+           "attach to an inner (non-Seq) stmt instead";
+  }
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::SeqStmts; }
   [[nodiscard]] std::string TypeName() const override { return "SeqStmts"; }
@@ -845,7 +870,8 @@ class EvalStmt : public Stmt {
    * @param expr Expression to execute
    * @param span Source location
    */
-  EvalStmt(ExprPtr expr, Span span) : Stmt(std::move(span)), expr_(std::move(expr)) {}
+  EvalStmt(ExprPtr expr, Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)), expr_(std::move(expr)) {}
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::EvalStmt; }
   [[nodiscard]] std::string TypeName() const override { return "EvalStmt"; }
@@ -873,7 +899,8 @@ using EvalStmtPtr = std::shared_ptr<const EvalStmt>;
  */
 class BreakStmt : public Stmt {
  public:
-  explicit BreakStmt(Span span) : Stmt(std::move(span)) {}
+  explicit BreakStmt(Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)) {}
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::BreakStmt; }
   [[nodiscard]] std::string TypeName() const override { return "BreakStmt"; }
@@ -890,7 +917,8 @@ using BreakStmtPtr = std::shared_ptr<const BreakStmt>;
  */
 class ContinueStmt : public Stmt {
  public:
-  explicit ContinueStmt(Span span) : Stmt(std::move(span)) {}
+  explicit ContinueStmt(Span span, std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)) {}
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::ContinueStmt; }
   [[nodiscard]] std::string TypeName() const override { return "ContinueStmt"; }
@@ -899,6 +927,35 @@ class ContinueStmt : public Stmt {
 };
 
 using ContinueStmtPtr = std::shared_ptr<const ContinueStmt>;
+
+/**
+ * @brief Attach leading comments to an existing statement
+ *
+ * Stmts are handed around as `shared_ptr<const Stmt>` to discourage mutation of
+ * semantic fields, but `leading_comments_` is IgnoreField metadata that has no
+ * effect on structural equality or hashing. This helper is the single sanctioned
+ * mutation channel (e.g., for the Python parser attaching extracted comments
+ * after building a stmt). The `const_cast` is safe because the helper requires
+ * the caller already holds a StmtPtr referencing a concrete, owned stmt.
+ *
+ * Rejects `SeqStmts` targets: it is a transparent container and the printer
+ * enforces that its leading_comments_ is always empty. Attach comments to an
+ * inner stmt instead.
+ *
+ * Not thread-safe: concurrent callers must coordinate since the mutation is
+ * performed through `const_cast` on the shared target.
+ *
+ * @param stmt Statement to annotate (must be non-null, not a SeqStmts)
+ * @param comments Comment lines (without leading '#')
+ * @return The same StmtPtr, with `leading_comments_` replaced by `comments`
+ */
+inline StmtPtr AttachLeadingComments(StmtPtr stmt, std::vector<std::string> comments) {
+  CHECK(stmt) << "AttachLeadingComments: stmt must not be null";
+  CHECK(stmt->GetKind() != ObjectKind::SeqStmts)
+      << "AttachLeadingComments: cannot attach to SeqStmts; attach to an inner stmt instead";
+  const_cast<Stmt&>(*stmt).leading_comments_ = std::move(comments);
+  return stmt;
+}
 
 }  // namespace ir
 }  // namespace pypto

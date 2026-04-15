@@ -273,6 +273,18 @@ void BindIRBuilder(nb::module_& m) {
            "Raises:\n"
            "    RuntimeError: If not inside a valid context")
 
+      .def("push_pending_leading_comments", &IRBuilder::PushPendingLeadingComments, nb::arg("comments"),
+           "Push leading comments onto the pending stack.\n\n"
+           "The DSL parser calls this before dispatching to a parse_* helper.\n"
+           "The first stmt emitted in the same context as the push absorbs the\n"
+           "queued comments through its ctor path. Pair every push with exactly\n"
+           "one pop_pending_leading_comments.")
+
+      .def("pop_pending_leading_comments", &IRBuilder::PopPendingLeadingComments,
+           "Pop the top pending entry, returning whatever stayed unconsumed.\n\n"
+           "If the dispatched helper emitted a matching stmt, the result is empty.\n"
+           "Otherwise the parser re-queues the returned comments onto the next line.")
+
       .def("assign", &IRBuilder::Assign, nb::arg("var"), nb::arg("value"), nb::arg("span"),
            "Create an assignment statement and emit it.\n\n"
            "Convenience method that creates and emits an assignment.\n\n"

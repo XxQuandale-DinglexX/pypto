@@ -179,7 +179,7 @@ def _normalize_inferred_type_for_annotation(
 class ASTParser:
     """Parses Python AST and builds IR using IRBuilder."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         source_file: str,
         source_lines: list[str],
@@ -191,6 +191,7 @@ class ASTParser:
         closure_vars: dict[str, Any] | None = None,
         buffer_name_meta: dict[tuple[str, str], dict[str, Any]] | None = None,
         dyn_var_cache: dict[str, ir.Var] | None = None,
+        pending_comments: dict[int, list[tuple[int, str]]] | None = None,
     ):
         """Initialize AST parser.
 
@@ -209,6 +210,9 @@ class ASTParser:
             dyn_var_cache: Optional shared cache mapping dynamic var names to ir.Var objects.
                 When multiple functions in a @pl.program share this dict, the same DynVar
                 produces the same ir.Var across functions.
+            pending_comments: Map from 1-based line number to ``#``-stripped comment lines
+                (produced by :func:`extract_line_comments`). Drained in source order and
+                attached as ``leading_comments`` metadata to the stmt that follows.
         """
         self.span_tracker = SpanTracker(source_file, source_lines, line_offset, col_offset)
         self.scope_manager = ScopeManager(strict_ssa=strict_ssa)
@@ -256,6 +260,11 @@ class ASTParser:
         )
         # Current function name (set during parse_function)
         self._func_name: str = ""
+
+        # Pending comments keyed by 1-based line number, drained by parse_statement.
+        # Each entry is (col_offset, text) so the parser can distinguish
+        # tail-of-block comments (inside body indent) from outer-scope comments.
+        self._pending_comments: dict[int, list[tuple[int, str]]] = pending_comments or {}
 
     @contextmanager
     def _yield_tracking_scope(self) -> Iterator[None]:
@@ -370,13 +379,13 @@ class ASTParser:
                 else:
                     f.return_type(return_type)
 
-            # Parse function body (skip docstrings)
-            for i, stmt in enumerate(func_def.body):
-                # Skip docstrings (string constants as first statement or after decorators)
-                if i == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
-                    if isinstance(stmt.value.value, str):
-                        continue  # Skip docstring
-                self.parse_statement(stmt)
+            # Parse function body. Docstrings (bare-string expressions anywhere
+            # in the body) are rerouted as leading_comments on the next stmt by
+            # parse_statement — no separate skip is needed here.
+            self._parse_body_siblings(func_def.body)
+            # Function body is the outermost scope — sweep all remaining
+            # pending comments (including any beyond end_lineno) as tails.
+            self._discard_tail_block_comments(func_def.body, upper_line=None)
 
         # Exit function scope
         self.scope_manager.exit_scope()
@@ -386,9 +395,39 @@ class ASTParser:
     def parse_statement(self, stmt: ast.stmt) -> None:
         """Parse a statement node.
 
+        Drains pending ``#`` comments on lines up to ``stmt.end_lineno`` and
+        attaches them as leading comments on the emitted IR stmt. Bare-string
+        expressions (docstrings) are not emitted as IR; their text is rerouted
+        into ``_pending_comments`` so the next stmt picks them up as leading
+        comments.
+
         Args:
             stmt: AST statement node
         """
+        leading = self._drain_pending_comments(stmt)
+
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            # Bare-string expression — treat as comment text on the next stmt.
+            # Prepend any `#` comments already collected for this line so the
+            # printed order matches source order.
+            doc_lines = stmt.value.value.splitlines() or [""]
+            self._requeue_comments_after(stmt, [*leading, *doc_lines])
+            return
+
+        # Push leading comments onto the builder's pending stack BEFORE
+        # dispatching. The first stmt the helper emits in the same context as
+        # this push absorbs the queued comments through its ctor path. The
+        # stack (rather than a single slot) lets nested parse_statement calls
+        # (this compound stmt + its body stmts) each have their own pending
+        # entry without clobbering the outer one. If the helper emits nothing
+        # (e.g. pl.static_assert, pass), pop returns the entry untouched and
+        # we re-queue it into _pending_comments so the next stmt picks it up.
+        self.builder.push_pending_leading_comments(leading)
+
         if isinstance(stmt, ast.AnnAssign):
             self.parse_annotated_assignment(stmt)
         elif isinstance(stmt, ast.Assign):
@@ -410,7 +449,7 @@ class ASTParser:
         elif isinstance(stmt, ast.Continue):
             self.parse_continue(stmt)
         elif isinstance(stmt, ast.Pass):
-            pass  # No-op: pass statements produce no IR
+            pass  # Produces no IR; residue handling below re-queues the comments.
         else:
             raise UnsupportedFeatureError(
                 f"Unsupported statement type: {type(stmt).__name__}",
@@ -418,6 +457,256 @@ class ASTParser:
                 hint="Only assignments, for loops, while loops, if statements, "
                 "with statements, returns, break, continue, and pass are supported in DSL functions",
             )
+
+        # Pop the pending entry we pushed above. If the helper emitted a
+        # matching stmt, the result is empty. Otherwise the unconsumed
+        # comments get re-queued into _pending_comments so the next source
+        # stmt picks them up.
+        residue = self.builder.pop_pending_leading_comments()
+        if residue:
+            self._requeue_comments_after(stmt, residue)
+
+    def _parse_body_siblings(self, body: Sequence[ast.stmt]) -> None:
+        """Parse a block's body stmts, applying stale-pending sweeps between siblings.
+
+        The inter-sibling sweep catches tail-of-block comments that live in the
+        gap between one sibling's body (which has already closed) and the next
+        sibling. Skipped for the first sibling since there is no prior closed
+        block — any pending comments at that point belong to the enclosing
+        compound stmt's header or leading attachments.
+        """
+        for i, stmt in enumerate(body):
+            if i > 0:
+                self._discard_stale_pending_before(stmt)
+            self.parse_statement(stmt)
+
+    def _then_branch_tail_upper(self, stmt: ast.If) -> int:
+        """Inclusive upper-bound line for the then-branch's tail-drop range.
+
+        Points to the line just before the ``else:`` keyword when an else
+        clause is present (so the then-branch tail does not extend into
+        else-body leading comments), and falls back to the if-stmt's end line
+        when there is no else clause.
+        """
+        if not stmt.orelse:
+            return stmt.end_lineno or stmt.lineno
+        else_line = self._find_else_keyword_line(stmt)
+        if else_line is not None:
+            return else_line - 1
+        return stmt.orelse[0].lineno - 1
+
+    def _find_else_keyword_line(self, stmt: ast.If) -> int | None:
+        """Return the source line of the ``else:`` keyword for an if-stmt.
+
+        Python's AST has no node for the ``else:`` keyword itself; its line can
+        only be recovered by scanning the source text between the last then-body
+        stmt and the first orelse stmt. Used to compute the exact upper bound of
+        the then-branch for :meth:`_discard_tail_block_comments` so that
+        comments physically inside the else branch (e.g. leading comments for
+        the first else stmt) are not mistaken for then-branch tails.
+
+        Returns ``None`` if not found (e.g. ``elif`` chains lack an ``else:``
+        keyword line).
+        """
+        if not stmt.orelse:
+            return None
+        src = self.span_tracker.source_lines
+        start = (stmt.body[-1].end_lineno or stmt.body[-1].lineno) + 1
+        end = stmt.orelse[0].lineno  # exclusive
+        for line_no in range(start, end):
+            idx = line_no - 1
+            if not (0 <= idx < len(src)):
+                continue
+            stripped = src[idx].lstrip()
+            # Match `else:` (optionally followed by whitespace/comment) but not
+            # `elif ...` (which is a separate else-branch chain lowered into
+            # ast.If.orelse[0] and has no `else:` keyword).
+            if stripped.startswith("else") and stripped[4:5] in (":", " ", "\t"):
+                return line_no
+        return None
+
+    @staticmethod
+    def _header_ast_end_line(stmt: ast.stmt) -> int:
+        """Last AST line of a compound stmt's header, before the body's colon.
+
+        For a wrapped multi-line header (e.g. ``for i in pl.range(\n  10,\n):``)
+        this returns the line of the closing ``)``/``:``; for a simple
+        single-line header it returns ``stmt.lineno``.
+
+        Used to classify comments between ``stmt.lineno`` and ``body[0].lineno``:
+        comments on a line ``<= header_ast_end`` belong to the header; comments
+        on later lines are body-leading for ``body[0]``.
+        """
+        ends: list[int] = [stmt.lineno]
+        if isinstance(stmt, ast.For):
+            ends.append(stmt.target.end_lineno or stmt.target.lineno)
+            ends.append(stmt.iter.end_lineno or stmt.iter.lineno)
+        elif isinstance(stmt, (ast.While, ast.If)):
+            ends.append(stmt.test.end_lineno or stmt.test.lineno)
+        elif isinstance(stmt, ast.With):
+            for item in stmt.items:
+                ends.append(item.context_expr.end_lineno or item.context_expr.lineno)
+                if item.optional_vars is not None:
+                    ends.append(item.optional_vars.end_lineno or item.optional_vars.lineno)
+        return max(ends)
+
+    def _drain_pending_comments(self, stmt: ast.stmt) -> list[str]:
+        """Collect pending comments whose line numbers fall at or before ``stmt``.
+
+        For simple stmts, drain through ``stmt.end_lineno`` so trailing comments
+        on the last logical line (e.g. ``y = 1  # note``) attach to the stmt.
+
+        For compound stmts (``for``/``while``/``if``/``with``) with a non-empty
+        body, the header can span multiple physical lines. We drain up to the
+        line just before the first body stmt and split by column: comments at
+        a column *less than* the body's indent are header-level and attach to
+        the compound stmt; comments at the body's indent are left pending for
+        the first body stmt to pick up.
+
+        Returns comments in source order and removes header/simple entries from
+        the pending map.
+        """
+        if not self._pending_comments:
+            return []
+        body = getattr(stmt, "body", None)
+        leading: list[str] = []
+        if isinstance(body, list) and body:
+            header_end = body[0].lineno - 1
+            header_ast_end = self._header_ast_end_line(stmt)
+            body_col = body[0].col_offset
+            for line in sorted(k for k in self._pending_comments if k <= header_end):
+                if stmt.lineno <= line <= header_ast_end:
+                    # Header-level comment: either an inline trailer on the
+                    # header's first line (e.g. `for i in range(16):  # tiles`)
+                    # or a continuation-line comment inside a wrapped multi-line
+                    # header (e.g. `for i in pl.range(\n  10,  # comment\n):`).
+                    # Attach to the compound stmt regardless of column.
+                    leading.extend(text for _col, text in self._pending_comments.pop(line))
+                    continue
+                if line > header_ast_end:
+                    # Past the header but before body[0] — this is a body-leading
+                    # comment for body[0]. Leave pending for body[0] to pick up.
+                    continue
+                # line < stmt.lineno: pre-stmt leftover. Split by column —
+                # shallower-than-body attaches to this compound stmt; same-or-
+                # deeper stays pending (belongs to body).
+                kept: list[tuple[int, str]] = []
+                for col, text in self._pending_comments[line]:
+                    if col < body_col:
+                        leading.append(text)
+                    else:
+                        kept.append((col, text))
+                if kept:
+                    self._pending_comments[line] = kept
+                else:
+                    del self._pending_comments[line]
+        else:
+            end_line = stmt.end_lineno or stmt.lineno
+            for line in sorted(k for k in self._pending_comments if k <= end_line):
+                leading.extend(text for _col, text in self._pending_comments.pop(line))
+        return leading
+
+    def _requeue_comments_after(self, stmt: ast.stmt, comments: list[str]) -> None:
+        """Re-enqueue ``comments`` onto the line after ``stmt`` ends.
+
+        Used when a stmt does not produce IR (docstring reroute, bare ``pass``)
+        but may have collected leading comments that must survive to the next
+        stmt. No-op when ``comments`` is empty. Synthetic comments inherit the
+        stmt's column offset so they are treated as body-level for tail-drop
+        purposes.
+        """
+        if not comments:
+            return
+        next_line = (stmt.end_lineno or stmt.lineno) + 1
+        col = stmt.col_offset
+        entries = [(col, text) for text in comments]
+        existing = self._pending_comments.setdefault(next_line, [])
+        self._pending_comments[next_line] = [*entries, *existing]
+
+    def _discard_tail_block_comments(self, body: list[ast.stmt], upper_line: int | None) -> None:
+        """Drop pending tail comments inside a block's physical line range.
+
+        Called after a block's body finishes parsing. Sweeps pending comments on
+        lines in ``[body[0].lineno, upper_line]`` whose column is
+        ``>= body[0].col_offset`` and drops them with a warning.
+
+        ``upper_line`` must be the inclusive upper bound of the block's physical
+        extent (typically the enclosing compound stmt's ``end_lineno``, or the
+        line before the next sibling clause such as ``else:``). Passing ``None``
+        means "no upper bound" — sweep all remaining pending comments from
+        ``body_start`` onward; used for the function body (outermost scope).
+
+        Bounding is necessary because ``_pending_comments`` is populated
+        up-front from the entire source, so comments in yet-to-parse sibling
+        blocks at the same indent would otherwise be swept in error.
+        """
+        if not body or not self._pending_comments:
+            return
+        block_col = body[0].col_offset
+        block_start = body[0].lineno
+        tail: list[tuple[int, str]] = []
+        if upper_line is None:
+            candidates = [k for k in self._pending_comments if k >= block_start]
+        else:
+            candidates = [k for k in self._pending_comments if block_start <= k <= upper_line]
+        for line in sorted(candidates):
+            remaining: list[tuple[int, str]] = []
+            for col, text in self._pending_comments[line]:
+                if col >= block_col:
+                    tail.append((line, text))
+                else:
+                    remaining.append((col, text))
+            if remaining:
+                self._pending_comments[line] = remaining
+            else:
+                del self._pending_comments[line]
+        self._emit_tail_warning(tail)
+
+    def _discard_stale_pending_before(self, stmt: ast.stmt) -> None:
+        """Drop pending comments on earlier lines at deeper indent than ``stmt``.
+
+        When parsing advances to ``stmt``, any pending comment on a line
+        ``< stmt.lineno`` whose column is strictly greater than
+        ``stmt.col_offset`` physically lives inside a previous sibling block
+        whose body has already closed (dedent). Those comments cannot attach to
+        ``stmt`` (wrong indent level) and would otherwise be misattributed by
+        the simple-stmt drain, so sweep them here as tail-of-block.
+
+        This is the mechanism that catches tail comments in the "gap" between
+        one block's body and the next outer-scope stmt — complementing the
+        bounded :meth:`_discard_tail_block_comments` that runs at block exit.
+        """
+        if not self._pending_comments:
+            return
+        stale: list[tuple[int, str]] = []
+        for line in sorted(k for k in self._pending_comments if k < stmt.lineno):
+            remaining: list[tuple[int, str]] = []
+            for col, text in self._pending_comments[line]:
+                if col > stmt.col_offset:
+                    stale.append((line, text))
+                else:
+                    remaining.append((col, text))
+            if remaining:
+                self._pending_comments[line] = remaining
+            else:
+                del self._pending_comments[line]
+        self._emit_tail_warning(stale)
+
+    @staticmethod
+    def _emit_tail_warning(tail: list[tuple[int, str]]) -> None:
+        """Emit a UserWarning summarizing dropped tail-of-block comments."""
+        if not tail:
+            return
+        preview = ", ".join(f"line {line}: {text!r}" for line, text in tail[:3])
+        if len(tail) > 3:
+            preview += f", … (+{len(tail) - 3} more)"
+        warnings.warn(
+            f"Dropped {len(tail)} tail-of-block comment(s): {preview}. "
+            "Tail-of-block comments are not preserved in IR; move them above a "
+            "statement or into the outer scope to retain them.",
+            UserWarning,
+            stacklevel=3,
+        )
 
     def parse_annotated_assignment(self, stmt: ast.AnnAssign) -> None:  # noqa: PLR0912
         """Parse annotated assignment: var: type = value.
@@ -927,8 +1216,8 @@ class ASTParser:
                 self._setup_iter_args(loop, iter_args_node, range_args["init_values"])
 
             with self._yield_tracking_scope():
-                for body_stmt in stmt.body:
-                    self.parse_statement(body_stmt)
+                self._parse_body_siblings(stmt.body)
+                self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
                 assert self._current_yield_vars is not None  # Guaranteed by _yield_tracking_scope
                 loop_output_vars = self._current_yield_vars[:]
 
@@ -1368,16 +1657,16 @@ class ASTParser:
     def _parse_while_body_statements(self, stmt: ast.For) -> list[str]:
         """Parse body statements for pl.while_() loop, return yielded vars."""
         with self._yield_tracking_scope():
-            # Parse body (skip first statement which is pl.cond())
+            # Validate body (skip first statement which is pl.cond()).
             for body_stmt in stmt.body[1:]:
-                # Check if pl.cond() appears anywhere else in body
                 if self._is_cond_call(body_stmt):
                     raise ParserSyntaxError(
                         "pl.cond() can only be the first statement in a pl.while_() loop body",
                         span=self.span_tracker.get_span(body_stmt),
                         hint="Remove this pl.cond() - condition is already specified at the start",
                     )
-                self.parse_statement(body_stmt)
+            self._parse_body_siblings(stmt.body[1:])
+            self._discard_tail_block_comments(stmt.body[1:], upper_line=stmt.end_lineno)
 
             assert self._current_yield_vars is not None  # Guaranteed by _yield_tracking_scope
             return self._current_yield_vars[:]
@@ -1495,8 +1784,8 @@ class ASTParser:
             self.scope_manager.enter_scope("while")
 
             # Parse body statements
-            for body_stmt in stmt.body:
-                self.parse_statement(body_stmt)
+            self._parse_body_siblings(stmt.body)
+            self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
 
             # Variables leak to outer scope (ConvertToSSA will handle)
             self.scope_manager.exit_scope(leak_vars=True)
@@ -1546,16 +1835,16 @@ class ASTParser:
 
                 # Parse then branch (yield types captured via _current_yield_types)
                 self.scope_manager.enter_scope("if")
-                for then_stmt in stmt.body:
-                    self.parse_statement(then_stmt)
+                self._parse_body_siblings(stmt.body)
+                self._discard_tail_block_comments(stmt.body, upper_line=self._then_branch_tail_upper(stmt))
                 self.scope_manager.exit_scope(leak_vars=should_leak)
 
                 # Parse else branch if present
                 if stmt.orelse:
                     if_builder.else_()
                     self.scope_manager.enter_scope("else")
-                    for else_stmt in stmt.orelse:
-                        self.parse_statement(else_stmt)
+                    self._parse_body_siblings(stmt.orelse)
+                    self._discard_tail_block_comments(stmt.orelse, upper_line=stmt.end_lineno)
                     self.scope_manager.exit_scope(leak_vars=should_leak)
 
                 # Declare return vars AFTER parsing branches so captured yield types
@@ -1850,8 +2139,8 @@ class ASTParser:
         with self.builder.scope(scope_kind, span, level=level, role=role, split=split, name_hint=name_hint):
             with self._scope_kind_context(scope_kind):
                 self.scope_manager.enter_scope("scope")
-                for body_stmt in stmt.body:
-                    self.parse_statement(body_stmt)
+                self._parse_body_siblings(stmt.body)
+                self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
                 self.scope_manager.exit_scope(leak_vars=True)
 
     def _parse_at_scope(self, stmt: ast.With, context_expr: ast.Call) -> None:

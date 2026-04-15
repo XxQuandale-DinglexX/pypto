@@ -491,6 +491,24 @@ class IRBuilder:
         """
         self._builder.emit(stmt)
 
+    def push_pending_leading_comments(self, comments: list[str]) -> None:
+        """Push leading comments onto the pending stack.
+
+        The DSL parser calls this before dispatching to a ``parse_*`` helper.
+        Pair every push with exactly one ``pop_pending_leading_comments``.
+
+        Args:
+            comments: Comment lines (without leading ``#``)
+        """
+        self._builder.push_pending_leading_comments(comments)
+
+    def pop_pending_leading_comments(self) -> list[str]:
+        """Pop the top pending entry, returning whatever stayed unconsumed.
+
+        Returns ``[]`` when the matching emit already consumed the queue.
+        """
+        return self._builder.pop_pending_leading_comments()
+
     def return_stmt(
         self,
         values: int | float | ir.Expr | Sequence[int | float | ir.Expr] | None = None,
